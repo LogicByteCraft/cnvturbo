@@ -67,6 +67,19 @@ git pull --ff-only origin "$CURRENT_BRANCH"
 # ── 3. 本地构建 + 校验 ────────────────────────────────────────────────────
 log "清理 dist/，开始本地构建（解释器: $PY）..."
 rm -rf dist build ./*.egg-info
+
+# 检测 PEP 668：若解释器禁止 pip install（Debian/Ubuntu 24.04+ 系统 Python），
+# 自动创建/复用本地构建 venv，避免污染系统并跳过 externally-managed 限制
+TOOL_VENV="$REPO_ROOT/.venv-release"
+if ! "$PY" -m pip install --dry-run --quiet pip >/dev/null 2>&1; then
+  if [[ ! -x "$TOOL_VENV/bin/python" ]]; then
+    log "解释器受 PEP 668 限制，创建本地构建 venv: .venv-release/"
+    "$PY" -m venv "$TOOL_VENV" || err "创建 venv 失败，请安装 python3-venv (apt install python3-venv)"
+  fi
+  PY="$TOOL_VENV/bin/python"
+  log "切换到隔离 venv 解释器: $PY"
+fi
+
 "$PY" -m pip install --quiet --upgrade pip build twine
 "$PY" -m build
 "$PY" -m twine check --strict dist/*
