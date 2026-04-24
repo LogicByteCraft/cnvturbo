@@ -19,6 +19,18 @@ cd "$REPO_ROOT"
 err() { printf '\033[31m[ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 log() { printf '\033[36m[release]\033[0m %s\n' "$*"; }
 
+# 探测 Python 解释器：优先环境变量 PY，否则 python3 → python
+# 如想指定 conda env：PY=/home/dell/miniforge3/envs/myenv/bin/python scripts/release.sh ...
+if [[ -n "${PY:-}" ]]; then
+  command -v "$PY" >/dev/null || err "PY=$PY 不可执行"
+elif command -v python3 >/dev/null; then
+  PY=python3
+elif command -v python >/dev/null; then
+  PY=python
+else
+  err "未找到 python3/python，请先安装 Python 3.10+ 或设置 PY 环境变量"
+fi
+
 VERSION="${1:-}"
 MODE="${2:-pypi}"   # pypi | --testpypi | --local-only
 
@@ -53,11 +65,11 @@ git fetch --tags origin
 git pull --ff-only origin "$CURRENT_BRANCH"
 
 # ── 3. 本地构建 + 校验 ────────────────────────────────────────────────────
-log "清理 dist/，开始本地构建..."
+log "清理 dist/，开始本地构建（解释器: $PY）..."
 rm -rf dist build ./*.egg-info
-python -m pip install --quiet --upgrade pip build twine
-python -m build
-twine check --strict dist/*
+"$PY" -m pip install --quiet --upgrade pip build twine
+"$PY" -m build
+"$PY" -m twine check --strict dist/*
 log "本地构建通过：$(ls dist/)"
 
 if [[ "$MODE" == "--local-only" ]]; then
