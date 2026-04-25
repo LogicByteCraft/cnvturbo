@@ -7,7 +7,7 @@
 
 **`cnvturbo`** — A Python re-implementation of [R inferCNV](https://github.com/broadinstitute/inferCNV) for single-cell RNA-seq copy-number variation analysis. **Algorithmically faithful to R inferCNV's HMM i6 pipeline, ~100× faster, and fully integrated with the Scanpy / AnnData ecosystem.**
 
-> Rewritten in pure Python with R-exact algorithm alignment (hspike emission calibration, gene-level Viterbi in copy-ratio space, R-equivalent denoise + subcluster Tumor calling), plus Numba/CUDA-accelerated kernels.
+> Rewritten in pure Python with R-exact algorithm alignment (hspike emission calibration, gene-level Viterbi in copy-ratio space, R-equivalent denoise + subcluster Tumor calling). The R-exact pipeline runs on CPU + joblib; optional Numba CPU / PyTorch CUDA kernels accelerate the legacy `tl.infercnv` and `tl.hmm_call_cells` paths.
 
 ---
 
@@ -20,11 +20,18 @@
 | Per-chromosome Viterbi (copy-ratio) | ✓ | ✗ | ✓ |
 | Denoise (segment-length filter) | ✓ | ✗ | ✓ |
 | Reference subcluster handling | ✓ | partial | ✓ |
-| GPU / Numba acceleration | ✗ | ✗ | ✓ |
+| GPU / Numba acceleration | ✗ | ✗ | ✓ (legacy `tl.infercnv` + `tl.hmm_call_cells`; R-exact path is CPU + joblib) |
 | Runtime (P12, 7,269 cells) | **~5 hr** | ~9 min | **~86 s** |
-| Cell-level concordance with R | 1.000 (ref) | 0.81 | **1.000** |
+| Cell-level concordance with R | 1.000 (ref) | N/A (no cell-level HMM) | **1.000** |
 
-Verified on 3 PDAC samples (15,135 cells total): **cell-level Tumor/Normal classification 100% identical to R inferCNV's HMM output**, while running 100–200× faster. See [Benchmark](#benchmark) below.
+Verified on 3 PDAC samples (15,135 cells total): **cell-level Tumor/Normal classification 100% identical to R inferCNV's HMM output**, while running 100–200× faster on CPU alone. See [Benchmark](#benchmark) below.
+
+> **Speed-up attribution**: the R-exact main pipeline (`infercnv_r_compat` +
+> `compute_hspike_emission_params` + `hmm_call_subclusters`) is **CPU + joblib only**.
+> All speed-up numbers in this README come from algorithmic rewrite +
+> multi-core parallelism, **not** GPU. The optional GPU back-end currently
+> only accelerates the legacy `tl.infercnv` (sliding-window scoring) and
+> `tl.hmm_call_cells` (no-subcluster HMM) paths.
 
 ---
 
@@ -38,14 +45,18 @@ pip install cnvturbo
 
 ### With acceleration backends
 
+These extras are **only used by the legacy `tl.infercnv` and `tl.hmm_call_cells`
+paths** (see [Backend coverage](#backend-coverage)). The R-exact main pipeline
+runs on stock CPU + joblib regardless of which extra you install.
+
 ```bash
-# CPU acceleration (Numba)
+# Numba CPU kernels (legacy `tl.infercnv` sliding-window + `tl.hmm_call_cells` Viterbi)
 pip install "cnvturbo[hmm-cpu]"
 
-# GPU acceleration (PyTorch)
+# PyTorch CUDA back-end (same scope as above; falls back to CPU if no GPU)
 pip install "cnvturbo[hmm-gpu]"
 
-# All accelerators + EM fitting
+# Everything above + Baum-Welch EM emission fitting (`hmmlearn`)
 pip install "cnvturbo[hmm]"
 ```
 
@@ -61,7 +72,11 @@ pip install -e ".[dev,test]"
 
 * Python ≥ 3.10
 * `scanpy ≥ 1.10`, `anndata ≥ 0.7.3`, `numpy ≥ 1.20`, `pandas ≥ 1`
-* Optional: `numba ≥ 0.57` (CPU), `torch ≥ 2.0` (GPU), `hmmlearn ≥ 0.3` (EM)
+* Optional accelerators (only effective for `tl.infercnv` + `tl.hmm_call_cells` —
+  the R-exact pipeline does not use them):
+    * `numba ≥ 0.57` — Numba parallel CPU kernels for sliding-window convolution
+    * `torch ≥ 2.0` — PyTorch CUDA back-end for sliding-window conv1d + batched Viterbi
+    * `hmmlearn ≥ 0.3` — Baum-Welch EM emission fitting (`fit_method="em"`)
 
 ---
 
@@ -277,10 +292,30 @@ cnvturbo
 
 * **R-exact pipeline**: `infercnv_r_compat` reproduces the full 8 R inferCNV steps in gene-space copy-ratio (vs. window-space log2 used by older Python ports).
 * **HMM i6 cell-level calling**: `hmm_call_subclusters` reproduces R's HMM Viterbi decoder, denoising, and per-subcluster Tumor classification — typically absent from existing Python implementations.
-* **Performance kernels**: Numba parallel CPU / PyTorch GPU back-ends for sliding-window convolution and batched Viterbi (`backend="auto" | "cpu" | "cuda"`).
+* **Performance kernels**: Numba parallel CPU + PyTorch CUDA back-ends for the
+  **legacy** `tl.infercnv` (sliding-window conv1d) and `tl.hmm_call_cells`
+  (batched Viterbi) paths (`backend="auto" | "cpu" | "cuda"`). The R-exact path
+  (`infercnv_r_compat` + `compute_hspike_emission_params` + `hmm_call_subclusters`)
+  currently runs on **CPU + joblib only** — see *Backend coverage* below.
 * **Robust to reference contamination**: emission std uses MAD (median absolute deviation) × 1.4826 instead of plain std, so reference cells contaminated by tumor cells don't inflate state widths.
 
 A high-level `infercnv` / `cnv_score` / `chromosome_heatmap` API similar to the de facto Python convention is also exposed for ease of migration.
+
+### Backend coverage
+
+| Function | Numba CPU | PyTorch CUDA | Notes |
+|---|---|---|---|
+| `tl.infercnv` (legacy sliding-window scoring) | ✓ | ✓ | `backend="auto"` picks GPU when available |
+| `tl.hmm_call_cells` (cell-level HMM, no subcluster) | ✓ | ✓ | same |
+| `tl.infercnv_r_compat` (**R-exact 8-step pipeline**) | — | — | CPU + `joblib` (`n_jobs`); no GPU code path |
+| `tl.compute_hspike_emission_params` | — | — | same |
+| `tl.hmm_call_subclusters` (**R-exact subcluster HMM**) | — | — | `use_r_viterbi=True` (default) is hard-wired to the R-pnorm CPU Viterbi; `backend` argument is currently a no-op on this path |
+
+**Practical implication.** If you follow the recommended `infercnv_r_compat`
++ `hmm_call_subclusters` workflow, install `cnvturbo` without any accelerator
+extra and tune `n_jobs` / `OMP_NUM_THREADS` for CPU throughput. GPU extras
+only help if you use the legacy `tl.infercnv` / `tl.hmm_call_cells` paths.
+Wiring the R-exact subcluster Viterbi onto GPU is on the roadmap.
 
 ---
 
@@ -290,7 +325,7 @@ If you use `cnvturbo` in your research, please cite this implementation:
 
 ```bibtex
 @software{cnvturbo,
-  title  = {cnvturbo: GPU/Numba-accelerated scRNA-seq CNV inference with R inferCNV-compatible HMM i6},
+  title  = {cnvturbo: A high-performance scRNA-seq CNV inference toolkit with R inferCNV-compatible HMM i6 (CPU + optional GPU back-ends)},
   url    = {https://github.com/LogicByteCraft/cnvturbo},
   year   = {2026}
 }

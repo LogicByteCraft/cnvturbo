@@ -6,7 +6,7 @@ requires = ["hatchling", "hatch-vcs"]
 [project]
 name = "cnvturbo"
 dynamic = ["version"]
-description = "cnvturbo: GPU/Numba-accelerated scRNA-seq CNV inference with HMM i6 cell-level tumor calling and R inferCNV-compatible raw-count pipeline. Fully compatible with Scanpy/AnnData. 10-100x faster than alternatives."
+description = "cnvturbo: A high-performance scRNA-seq CNV inference toolkit with R inferCNV-compatible HMM i6 cell-level tumor calling. The R-exact main pipeline runs on CPU + joblib (100-200x faster than R inferCNV); optional Numba/PyTorch CUDA back-ends accelerate the legacy infercnv + hmm_call_cells paths. Fully compatible with Scanpy/AnnData."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
@@ -47,8 +47,12 @@ copykat = [
     'rpy2'
 ]
 # HMM i6 加速依赖（可选）
-# CPU 加速：pip install cnvturbo[hmm-cpu]
-# GPU 加速：pip install cnvturbo[hmm-gpu]
+# 注意：这些 extras 只对 legacy `tl.infercnv` (sliding-window) +
+# `tl.hmm_call_cells` (cell-level Viterbi) 路径生效；R-exact 主路径
+# (`infercnv_r_compat` + `compute_hspike_emission_params` + `hmm_call_subclusters`)
+# 完全跑在 CPU + joblib 上，装这些 extras 不会带来任何加速。
+# CPU 加速 (Numba)：pip install cnvturbo[hmm-cpu]
+# GPU 加速 (PyTorch CUDA)：pip install cnvturbo[hmm-gpu]
 # Baum-Welch EM 拟合：pip install cnvturbo[hmm-em]
 # 全部功能：pip install cnvturbo[hmm]
 hmm-cpu = [

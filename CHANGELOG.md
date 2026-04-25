@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Documentation
+- 修订 `README.md` 与 `pyproject.toml` 中关于 GPU / Numba 加速的描述，明确后端
+  覆盖范围，避免读者误以为 R-兼容主路径享受 GPU 加速：
+    * 头部 hero 段落、对比表 "GPU / Numba acceleration" 行、Cell-level
+      concordance 行（infercnvpy 由占位的 `0.81` 改为 `N/A (no cell-level HMM)`）、
+      Benchmark 节、Optional Requirements、Design highlights、BibTeX title 全部
+      标注或拆分了 "**legacy `tl.infercnv` + `tl.hmm_call_cells` 路径走 GPU/Numba**"
+      与 "**R-exact 主路径目前仅 CPU + joblib**"。
+    * 新增 §Backend coverage 子节，逐函数列出 Numba CPU / PyTorch CUDA 支持
+      矩阵，并备注 `tl.hmm_call_subclusters` 的 `backend` 形参在
+      `use_r_viterbi=True`（默认）时是 no-op。
+    * 在 `[project.optional-dependencies]` 注释里注明这些 extras 不会加速 R-exact
+      主路径；`pyproject.toml` description 同步更新。
 - 重写 `docs/infercnv.rst`：去掉早期 `cnvturbo.tl.infercnv`（log-fold-change /
   lfc_cap / dynamic_threshold 那一套）的描述，改为只覆盖 R-兼容主线流程
   （`infercnv_r_compat` + `compute_hspike_emission_params` + `hmm_call_subclusters`
