@@ -8,116 +8,76 @@ Import cnvturbo together with scanpy as
    import scanpy as sc
    import cnvturbo as cnv
 
-For consistency, the cnvturbo API tries to follow the `scanpy API <https://scanpy.readthedocs.io/en/stable/api/index.html>`__
+For consistency, the cnvturbo API tries to follow the
+`scanpy API <https://scanpy.readthedocs.io/en/stable/api/index.html>`__
 as closely as possible.
+
+The public surface area is intentionally small and focused on the
+R-compatible ``inferCNV`` workflow. See :doc:`infercnv` for the full
+pipeline overview and :doc:`dev_notes` for non-obvious lessons.
 
 .. _api-io:
 
-Input/Output: `io`
-------------------
+Input/Output: ``io``
+--------------------
 
 .. module:: cnvturbo.io
 
 .. autosummary::
    :toctree: ./generated
 
-   genomic_position_from_biomart
    genomic_position_from_gtf
-   read_scevan
+   genomic_position_from_biomart
 
 
-Preprocessing: `pp`
--------------------
-
-.. module:: cnvturbo.pp
-
-.. autosummary::
-   :toctree: ./generated
-
-   neighbors
-
-
-Tools: `tl`
------------
-
-Tools add an interpretable annotation to the :class:`~anndata.AnnData` object
-which usually can be visualized by a corresponding plotting function.
-
-The tools for embeddings and clustering mirror the scanpy API.
-However, while the scanpy tools operate on transcriptomics data, the
-cnvturbo equivalent operates on CNV data.
+Tools: ``tl``
+-------------
 
 .. module:: cnvturbo.tl
 
+R-compatible inferCNV pipeline
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-InferCNV
-^^^^^^^^
-
-.. autosummary::
-   :toctree: ./generated
-
-   infercnv
-   copykat
-
-CNV scores
-^^^^^^^^^^
+These three functions are the canonical workflow. Always call them in
+this order on the same ``AnnData`` object.
 
 .. autosummary::
    :toctree: ./generated
 
-   cnv_score
-   ithcna
-   ithgex
+   infercnv_r_compat
+   compute_hspike_emission_params
+   hmm_call_subclusters
 
-Embeddings
-^^^^^^^^^^
+For per-cell HMM calls without leiden subclustering (rare; mostly used
+for benchmarking the cluster-level shortcut):
 
 .. autosummary::
    :toctree: ./generated
 
-   pca
-   umap
-   tsne
+   hmm_call_cells
 
-Clustering
-^^^^^^^^^^
+Per-cell scoring helpers
+^^^^^^^^^^^^^^^^^^^^^^^^
+
 .. autosummary::
    :toctree: ./generated
 
-   leiden
+   cnv_score_cell
+
+.. note::
+
+   ``cnv_score_cell`` has fallback paths that may not align with R's
+   ``cnv_signal_R``. For an R-equivalent per-cell signal, compute
+   ``mean(|X_cnv_r - 1|)`` directly on ``adata.obsm["X_cnv_r"]``.
+   See :doc:`dev_notes` § 2.
 
 
-
-Plotting: `pl`
---------------
+Plotting: ``pl``
+----------------
 
 .. module:: cnvturbo.pl
-
-InferCNV
-^^^^^^^^
 
 .. autosummary::
    :toctree: ./generated
 
    chromosome_heatmap
-   chromosome_heatmap_summary
-
-Embeddings
-^^^^^^^^^^
-.. autosummary::
-   :toctree: ./generated
-
-   umap
-   tsne
-
-
-Datasets: `datasets`
---------------------
-
-.. module:: cnvturbo.datasets
-
-.. autosummary::
-   :toctree: ./generated
-
-   maynard2020_3k
-   oligodendroglioma

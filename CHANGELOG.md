@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Documentation
+- 重写 `docs/infercnv.rst`：去掉早期 `cnvturbo.tl.infercnv`（log-fold-change /
+  lfc_cap / dynamic_threshold 那一套）的描述，改为只覆盖 R-兼容主线流程
+  （`infercnv_r_compat` + `compute_hspike_emission_params` + `hmm_call_subclusters`
+  三段式），并补上输入数据格式、各阶段输出键、per-cell score 取用表，与 R
+  对齐参数 / 顶刊 strict 双门控示例。
+- 精简 `docs/api.rst` 到 R-兼容工作流的核心 API 表面：去掉 `copykat` /
+  `ithcna` / `ithgex` / `pca` / `umap` / `tsne` / `chromosome_heatmap_summary` /
+  `leiden` / `read_scevan` / `pp.neighbors` 等旧 infercnvpy 风格条目（函数本身
+  仍存在，只是不再列入生成的参考页）；新增 `infercnv_r_compat` /
+  `compute_hspike_emission_params` / `hmm_call_subclusters` / `hmm_call_cells` /
+  `cnv_score_cell` 章节。
+- 新增 `docs/dev_notes.md`，沉淀四节非显然教训：
+    1. **不要在外部脚本里重建 cluster-level Viterbi**——记录 `sd_ci = base_sd /
+       sqrt(n_ci)` 在大 reference cluster 上退化的失败模式与正确做法（直接用
+       `obs["{key_added}_score"]`），附 PDAC 3 样本 strict κ ∈ {0.595, 0.816,
+       0.911} 的 regression baseline。
+    2. `cnv_score_cell` 的 HMM-based / fallback 双路径陷阱（`neutral_state=2`
+       默认与 R i6 不符；fallback 路径 `mean(|X|)` 漏减 1.0）。
+    3. v0.2.1 GTF Categorical 修复历史 + workaround。
+    4. 与 R inferCNV 默认值对齐的 9 项关键参数对照表（含 Smart-seq2 注意事项）。
+- 更新 `docs/index.md` toctree 加入 `dev_notes.md`。
+
 ## [0.2.1] - 2026-04-25
 
 ### Fixed
