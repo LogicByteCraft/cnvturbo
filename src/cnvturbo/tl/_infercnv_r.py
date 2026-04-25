@@ -48,6 +48,7 @@ def infercnv_r_compat(
     max_ref_threshold: float = 3.0,
     window_size: int = 101,
     exclude_chromosomes: Sequence[str] | None = ("chrX", "chrY"),
+    min_mean_expr_cutoff: float = 0.1,
     n_jobs: int | None = None,
     inplace: bool = True,
     key_added: str = "cnv",
@@ -86,6 +87,12 @@ def infercnv_r_compat(
         滑窗大小（R 默认 101；奇数）。
     exclude_chromosomes
         排除的染色体（默认排除 chrX/chrY）。
+    min_mean_expr_cutoff
+        与 R inferCNV 的 ``require_above_min_mean_expr_cutoff`` 等价：
+        过滤所有 ``mean(raw_count) < cutoff`` 的低表达基因。
+        10x 数据 R 默认 0.1；Smart-seq2 全长数据建议 1.0；
+        设为 0 可完全关闭过滤（与旧版行为一致，但不推荐）。
+        过滤后基因数通常会减少到原 var 的 10%~20%，与 R 行为一致。
     n_jobs
         CPU 线程数；None 使用全部核心。
     inplace
@@ -120,7 +127,24 @@ def infercnv_r_compat(
         raw_counts = raw_counts.toarray()
     raw_counts = np.asarray(raw_counts, dtype=np.float64)
 
+    # ── Step 1.5：低表达基因过滤（R `require_above_min_mean_expr_cutoff`）──
+    # R 中此步在归一化之前执行；后续 cell_totals 用的是过滤后的矩阵和。
+    # 不能在归一化后再做，否则 cell_totals 会包含被过滤掉的低表达基因贡献。
+    if min_mean_expr_cutoff is not None and min_mean_expr_cutoff > 0:
+        gene_raw_means = raw_counts.mean(axis=0)
+        lowexpr_full = gene_raw_means < float(min_mean_expr_cutoff)
+        n_filtered = int(lowexpr_full.sum())
+        if n_filtered > 0:
+            raw_counts = raw_counts[:, ~lowexpr_full]
+        logging.info(  # type: ignore
+            f"  reduce_by_cutoff: filtered {n_filtered} / {adata.n_vars} genes "
+            f"(mean raw count < {min_mean_expr_cutoff}); kept {raw_counts.shape[1]} genes"
+        )
+    else:
+        lowexpr_full = np.zeros(adata.n_vars, dtype=bool)
+
     # ── Step 2：库容归一化 → log2(x+1) ───────────────────────────────────────
+    # cell_totals 基于过滤后的 raw_counts，与 R `normalize_counts_by_seq_depth` 一致
     cell_totals = np.maximum(raw_counts.sum(axis=1, keepdims=True), 1.0)
     scale_factor = float(np.median(raw_counts.sum(axis=1)))
     scale_factor = max(scale_factor, 1.0)
@@ -144,17 +168,18 @@ def infercnv_r_compat(
     # ── Step 4：clip ──────────────────────────────────────────────────────────
     log_expr = np.clip(log_expr, -max_ref_threshold, max_ref_threshold).astype(np.float32)
 
-    # ── 构建基因坐标过滤掩码 ──────────────────────────────────────────────────
-    var_mask_null = adata.var["chromosome"].isnull()
+    # ── 构建基因坐标过滤掩码（在低表达过滤之后的 var 子集上）────────────────
+    var_after_low = adata.var.iloc[~lowexpr_full]   # (n_vars - n_lowexpr,) DataFrame
+    var_mask_null = var_after_low["chromosome"].isnull().values
     var_mask_excl = (
-        adata.var["chromosome"].isin(exclude_chromosomes)
+        var_after_low["chromosome"].isin(exclude_chromosomes).values
         if exclude_chromosomes is not None
-        else np.zeros(adata.n_vars, dtype=bool)
+        else np.zeros(var_after_low.shape[0], dtype=bool)
     )
     keep_mask = ~(var_mask_null | var_mask_excl)
     expr_filt = log_expr[:, keep_mask]
-    var_filt = adata.var.loc[keep_mask, ["chromosome", "start", "end"]]
-    logging.info(f"  Genes for smoothing: {keep_mask.sum()} / {adata.n_vars}")  # type: ignore
+    var_filt = var_after_low.loc[keep_mask, ["chromosome", "start", "end"]]
+    logging.info(f"  Genes for smoothing: {int(keep_mask.sum())} / {adata.n_vars}")  # type: ignore
 
     # ── Step 5：按染色体 same-length 滑窗平滑（gene 维输出） ─────────────────
     # 与 R smooth_by_chromosome 一致：每条染色体独立平滑，输出长度 = 该染色体基因数
@@ -227,10 +252,14 @@ def infercnv_r_compat(
     if inplace:
         adata.obsm[f"X_{key_added}"] = res
         # chr_pos: 基因级染色体起始下标；is_gene_space: 标记输入空间维度
+        # kept_var_names: X_{key_added} 的列对应的原始 var_names（已经过 reduce_by_cutoff
+        # + chromosome null/exclude 过滤），方便下游 join 回 adata.var。
         adata.uns[key_added] = {
             "chr_pos": chr_pos,
             "is_gene_space": True,
             "is_copy_ratio": bool(apply_2x_transform),
+            "kept_var_names": var_filt.index.to_list(),
+            "min_mean_expr_cutoff": float(min_mean_expr_cutoff or 0.0),
         }
         return None
     else:
@@ -310,6 +339,7 @@ def compute_hspike_emission_params(
     max_ref_threshold: float = 3.0,
     window_size: int = 101,
     exclude_chromosomes: Sequence[str] | None = ("chrX", "chrY"),
+    min_mean_expr_cutoff: float = 0.1,
     n_sim_cells: int = 100,
     n_genes_per_chr: int = 400,
     cnv_ratios: tuple[float, ...] = (0.01, 0.5, 1.0, 1.5, 2.0, 3.0),
@@ -357,7 +387,17 @@ def compute_hspike_emission_params(
         if exclude_chromosomes is not None
         else pd.Series(False, index=adata.var_names)
     )
-    keep_mask = ~(adata.var["chromosome"].isnull() | var_mask_excl)
+    # 与真实管线保持一致：低表达基因过滤（R `require_above_min_mean_expr_cutoff`）
+    if min_mean_expr_cutoff is not None and min_mean_expr_cutoff > 0:
+        gene_raw_means_full = raw_counts.mean(axis=0)
+        var_mask_lowexpr = pd.Series(
+            gene_raw_means_full < float(min_mean_expr_cutoff),
+            index=adata.var_names,
+        )
+    else:
+        var_mask_lowexpr = pd.Series(False, index=adata.var_names)
+
+    keep_mask = ~(adata.var["chromosome"].isnull() | var_mask_excl | var_mask_lowexpr)
     n_genes_total   = int(keep_mask.sum())
 
     # ── 构建合成基因组（与 R .get_hspike_chr_info 一致）────────────────────
