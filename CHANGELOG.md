@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-04-25
+
+### Fixed
+- `io.genomic_position_from_gtf` 在 `gtfparse >= 2.0` / pyarrow backend 下抛
+  `TypeError: can only concatenate str (not "Categorical") to str` 的问题。
+  根因：`gtfparse` 新版本默认返回 Categorical / ArrowExtensionArray 列，下游
+  `"chr" + col`、`col.str.startswith(...)`、`col.str.replace(...)` 都假设 object/str
+  dtype。修复方式是在拿到 GTF 后立即把 `chromosome` / `gene_id` / `gene_name` 三列
+  显式 `.astype(str)`，与旧版 gtfparse 的行为完全等价，不影响已正常工作的环境。
+  影响：v0.2.0 用户在新装的 `gtfparse` 环境下基本必然踩到此 bug，无需任何 workaround
+  （如手动重写 GTF 解析）即可升级到 v0.2.1 直接调用。
+- `io.genomic_position_from_biomart` 在 chromosome 字段被 cache/反序列化为
+  Categorical 时也存在同款隐患，一并加固。
+- 新增回归测试 `tests/test_io.py::test_get_genomic_position_from_gtf_categorical_chromosome`，
+  通过 mock `gtfparse.read_gtf` 强制返回 Categorical 列覆盖该退化场景。
+
 ## [0.2.0] - 2026-04-25
 
 ### Added
