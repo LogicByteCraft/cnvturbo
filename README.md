@@ -81,6 +81,7 @@ cnv_tl.infercnv_r_compat(
     reference_key="cell_type",
     reference_cat=["NK", "Endothelial", "Fibroblast"],
     window_size=101,
+    min_mean_expr_cutoff=0.1,    # R inferCNV default for 10x; use 1.0 for Smart-seq2
     apply_2x_transform=True,
     n_jobs=16,
 )
@@ -90,6 +91,7 @@ emit_means, emit_stds = cnv_tl.compute_hspike_emission_params(
     raw_layer="counts",
     reference_key="cell_type",
     reference_cat=["NK", "Endothelial", "Fibroblast"],
+    min_mean_expr_cutoff=0.1,    # 必须与 infercnv_r_compat 保持一致
     output_space="copy_ratio",
 )
 
@@ -137,8 +139,10 @@ genomic_position_from_gtf(
 
 ### 2. R-compatible preprocessing (`infercnv_r_compat`)
 
-Reproduces R inferCNV's 8-step pipeline exactly:
+Reproduces R inferCNV's pipeline exactly:
 
+0. **Low-expression gene filter** — `mean(raw_count) < min_mean_expr_cutoff`
+   (R `require_above_min_mean_expr_cutoff`; 10x default `0.1`, Smart-seq2 `1.0`)
 1. Library-size normalization → median depth
 2. `log2(x + 1)`
 3. First reference subtraction (gene-space, "bounds" mode)
@@ -157,6 +161,7 @@ cnv_tl.infercnv_r_compat(
     max_ref_threshold=3.0,
     window_size=101,
     exclude_chromosomes=("chrX", "chrY"),
+    min_mean_expr_cutoff=0.1,    # R inferCNV default for 10x; set 1.0 for Smart-seq2; 0 to disable
     apply_2x_transform=True,
     n_jobs=16,
     key_added="cnv",
@@ -166,6 +171,9 @@ cnv_tl.infercnv_r_compat(
 Output:
 * `adata.obsm["X_cnv"]` — `(n_cells × n_genes_filtered)` copy-ratio matrix
 * `adata.uns["cnv"]["chr_pos"]` — gene-level chromosome offsets
+* `adata.uns["cnv"]["kept_var_names"]` — original `var_names` that survived
+  `min_mean_expr_cutoff` + `chrX/chrY` exclusion (matches `obsm["X_cnv"]` columns)
+* `adata.uns["cnv"]["min_mean_expr_cutoff"]` — actual cutoff applied (provenance)
 
 ### 3. hspike emission calibration (`compute_hspike_emission_params`)
 
@@ -177,6 +185,7 @@ emit_means, emit_stds = cnv_tl.compute_hspike_emission_params(
     raw_layer="counts",
     reference_key="cell_type",
     reference_cat=["NK", "Endothelial"],
+    min_mean_expr_cutoff=0.1,    # 必须与 infercnv_r_compat 保持一致
     n_sim_cells=100,
     n_genes_per_chr=400,
     output_space="copy_ratio",
