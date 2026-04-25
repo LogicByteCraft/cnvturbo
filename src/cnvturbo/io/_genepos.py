@@ -54,8 +54,10 @@ def genomic_position_from_biomart(
                 "chromosome_name": "chromosome",
             }
         )
-        # use chr prefix for chromosome
-        .assign(chromosome=lambda x: "chr" + x["chromosome"])
+        # use chr prefix for chromosome (cast to str first so Categorical /
+        # ArrowExtensionArray returned by some pandas/scanpy backends does
+        # not break the string concatenation; see also genomic_position_from_gtf)
+        .assign(chromosome=lambda x: "chr" + x["chromosome"].astype(str))
     )
 
     gene_ids_adata = (adata.var_names if adata_gene_id is None else adata.var[adata_gene_id]).values
@@ -139,6 +141,14 @@ def genomic_position_from_gtf(
         .drop_duplicates()
         .rename(columns={"seqname": "chromosome"})
     )
+    # Categorical-safe: gtfparse (>=2.0 / pyarrow backend) returns Categorical /
+    # ArrowExtensionArray columns. Downstream string ops (`"chr" + col`,
+    # `.str.startswith`, `.str.replace`) all assume plain object/str dtype, so
+    # cast string columns up-front. Keeps existing behavior on older gtfparse
+    # versions that already returned object dtype.
+    for _c in ("chromosome", "gene_id", "gene_name"):
+        if _c in gtf.columns:
+            gtf[_c] = gtf[_c].astype(str)
     # remove ensembl versions
     gtf["gene_id"] = gtf["gene_id"].str.replace(r"\.\d+$", "", regex=True)
 
