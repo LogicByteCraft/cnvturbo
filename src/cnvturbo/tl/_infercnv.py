@@ -238,6 +238,20 @@ def _natural_sort(l: Sequence):
     return sorted(l, key=alphanum_key)
 
 
+def _ordered_chromosomes(var: pd.DataFrame) -> list[str]:
+    """返回平滑使用的染色体顺序，优先遵循 GTF 注释保留的 category 顺序。"""
+    chrom = var["chromosome"]
+    present = [str(x) for x in chrom.dropna().unique()]
+    present_set = set(present)
+    if isinstance(chrom.dtype, pd.CategoricalDtype) and chrom.cat.ordered:
+        chromosomes = [str(c) for c in chrom.cat.categories if str(c) in present_set]
+        seen = set(chromosomes)
+        chromosomes.extend([c for c in present if c not in seen])
+    else:
+        chromosomes = _natural_sort(present)
+    return [x for x in chromosomes if x.startswith("chr") and x != "chrM"]
+
+
 def _build_pyramid_kernel(n: int) -> np.ndarray:
     """构造归一化金字塔核（与原版等价）。"""
     r = np.arange(1, n + 1, dtype=np.float32)
@@ -476,16 +490,16 @@ def _running_mean_same_length_by_chromosome(
     chr_pos : {chr_name: gene_start_index}（基因级染色体边界）
     smoothed_genes : (N_cells, N_genes_filt) 平滑后矩阵（每基因一列）
     """
-    chromosomes = _natural_sort(
-        [x for x in var["chromosome"].unique() if x.startswith("chr") and x != "chrM"]
-    )
+    chromosomes = _ordered_chromosomes(var)
 
     chunks = []
     chr_pos = {}
     cum = 0
     for chr in chromosomes:
         gene_idx = var.index.get_indexer(
-            var.loc[var["chromosome"] == chr].sort_values("start").index.values
+            var.loc[var["chromosome"] == chr]
+            .sort_values("start", kind="mergesort")
+            .index.values
         )
         if len(gene_idx) == 0:
             continue
@@ -501,9 +515,7 @@ def _running_mean_by_chromosome(
     expr, var, window_size, step, calculate_gene_values
 ) -> tuple[dict, np.ndarray, pd.DataFrame | None]:
     """按染色体独立计算滑动均值并拼接。"""
-    chromosomes = _natural_sort(
-        [x for x in var["chromosome"].unique() if x.startswith("chr") and x != "chrM"]
-    )
+    chromosomes = _ordered_chromosomes(var)
 
     running_means = [
         _running_mean_for_chromosome(chr, expr, var, window_size, step, calculate_gene_values)
@@ -524,7 +536,11 @@ def _running_mean_by_chromosome(
 
 def _running_mean_for_chromosome(chr, expr, var, window_size, step, calculate_gene_values):
     """单条染色体的滑动均值。"""
-    genes = var.loc[var["chromosome"] == chr].sort_values("start").index.values
+    genes = (
+        var.loc[var["chromosome"] == chr]
+        .sort_values("start", kind="mergesort")
+        .index.values
+    )
     tmp_x = expr[:, var.index.get_indexer(genes)]
     x_conv, convolved_gene_values = _running_mean(
         tmp_x, n=window_size, step=step,
@@ -648,9 +664,7 @@ def _infercnv_gpu(
     import torch  # noqa: PLC0415
 
     device = torch.device("cuda")
-    chromosomes = _natural_sort(
-        [c for c in var["chromosome"].unique() if c.startswith("chr") and c != "chrM"]
-    )
+    chromosomes = _ordered_chromosomes(var)
 
     n_cells = expr.shape[0]
     all_results = []      # 收集每个 chunk 的 CNV 矩阵片段
@@ -684,7 +698,11 @@ def _infercnv_gpu(
         col_offset = 0
 
         for chrom in chromosomes:
-            genes = var.loc[var["chromosome"] == chrom].sort_values("start").index.values
+            genes = (
+                var.loc[var["chromosome"] == chrom]
+                .sort_values("start", kind="mergesort")
+                .index.values
+            )
             col_idx = var.index.get_indexer(genes)
             chrom_x = x_clipped[:, col_idx]  # (N_chunk, N_chrom_genes)
             n_genes = chrom_x.shape[1]

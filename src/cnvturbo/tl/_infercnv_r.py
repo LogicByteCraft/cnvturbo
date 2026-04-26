@@ -31,7 +31,7 @@ from tqdm.auto import tqdm
 
 from cnvturbo.tl._backend import get_n_jobs
 from cnvturbo.tl._infercnv import (
-    _natural_sort,
+    _ordered_chromosomes,
     _running_mean_same_length_by_chromosome,
 )
 
@@ -47,7 +47,7 @@ def infercnv_r_compat(
     reference_cat: str | Sequence[str] | None = None,
     max_ref_threshold: float = 3.0,
     window_size: int = 101,
-    exclude_chromosomes: Sequence[str] | None = ("chrX", "chrY"),
+    exclude_chromosomes: Sequence[str] | None = ("chrM", "chrMT", "MT", "M"),
     min_mean_expr_cutoff: float = 0.1,
     n_jobs: int | None = None,
     inplace: bool = True,
@@ -86,7 +86,7 @@ def infercnv_r_compat(
     window_size
         滑窗大小（R 默认 101；奇数）。
     exclude_chromosomes
-        排除的染色体（默认排除 chrX/chrY）。
+        排除的染色体（默认仅排除线粒体染色体，保留 chrX/chrY）。
     min_mean_expr_cutoff
         与 R inferCNV 的 ``require_above_min_mean_expr_cutoff`` 等价：
         过滤所有 ``mean(raw_count) < cutoff`` 的低表达基因。
@@ -127,21 +127,38 @@ def infercnv_r_compat(
         raw_counts = raw_counts.toarray()
     raw_counts = np.asarray(raw_counts, dtype=np.float64)
 
+    # ── Step 1.25：先限定到 R gene_order 基因池 ───────────────────────────
+    # R inferCNV 在 run() 之前的 infercnv_obj 已经只包含 gene_ordering_file 中
+    # 的基因；低表达过滤和 library-size 归一化都发生在这个基因池内。这里必须
+    # 先裁掉无坐标/排除染色体，否则全转录组库容会把 Step14 信号系统性压低。
+    var_full = adata.var[["chromosome", "start", "end"]]
+    var_mask_null = var_full["chromosome"].isnull().values
+    var_mask_excl = (
+        var_full["chromosome"].isin(exclude_chromosomes).values
+        if exclude_chromosomes is not None
+        else np.zeros(var_full.shape[0], dtype=bool)
+    )
+    gene_order_mask = ~(var_mask_null | var_mask_excl)
+    raw_counts = raw_counts[:, gene_order_mask]
+    var_gene_order = var_full.loc[gene_order_mask, :]
+    logging.info(  # type: ignore
+        f"  gene_order-compatible genes: {raw_counts.shape[1]} / {adata.n_vars}"
+    )
+
     # ── Step 1.5：低表达基因过滤（R `require_above_min_mean_expr_cutoff`）──
     # R 中此步在归一化之前执行；后续 cell_totals 用的是过滤后的矩阵和。
     # 不能在归一化后再做，否则 cell_totals 会包含被过滤掉的低表达基因贡献。
     if min_mean_expr_cutoff is not None and min_mean_expr_cutoff > 0:
         gene_raw_means = raw_counts.mean(axis=0)
-        lowexpr_full = gene_raw_means < float(min_mean_expr_cutoff)
-        n_filtered = int(lowexpr_full.sum())
+        lowexpr_mask = gene_raw_means < float(min_mean_expr_cutoff)
+        n_filtered = int(lowexpr_mask.sum())
         if n_filtered > 0:
-            raw_counts = raw_counts[:, ~lowexpr_full]
+            raw_counts = raw_counts[:, ~lowexpr_mask]
+            var_gene_order = var_gene_order.loc[~lowexpr_mask, :]
         logging.info(  # type: ignore
-            f"  reduce_by_cutoff: filtered {n_filtered} / {adata.n_vars} genes "
+            f"  reduce_by_cutoff: filtered {n_filtered} / {gene_order_mask.sum()} genes "
             f"(mean raw count < {min_mean_expr_cutoff}); kept {raw_counts.shape[1]} genes"
         )
-    else:
-        lowexpr_full = np.zeros(adata.n_vars, dtype=bool)
 
     # ── Step 2：库容归一化 → log2(x+1) ───────────────────────────────────────
     # cell_totals 基于过滤后的 raw_counts，与 R `normalize_counts_by_seq_depth` 一致
@@ -168,18 +185,23 @@ def infercnv_r_compat(
     # ── Step 4：clip ──────────────────────────────────────────────────────────
     log_expr = np.clip(log_expr, -max_ref_threshold, max_ref_threshold).astype(np.float32)
 
-    # ── 构建基因坐标过滤掩码（在低表达过滤之后的 var 子集上）────────────────
-    var_after_low = adata.var.iloc[~lowexpr_full]   # (n_vars - n_lowexpr,) DataFrame
-    var_mask_null = var_after_low["chromosome"].isnull().values
-    var_mask_excl = (
-        var_after_low["chromosome"].isin(exclude_chromosomes).values
-        if exclude_chromosomes is not None
-        else np.zeros(var_after_low.shape[0], dtype=bool)
-    )
-    keep_mask = ~(var_mask_null | var_mask_excl)
-    expr_filt = log_expr[:, keep_mask]
-    var_filt = var_after_low.loc[keep_mask, ["chromosome", "start", "end"]]
-    logging.info(f"  Genes for smoothing: {int(keep_mask.sum())} / {adata.n_vars}")  # type: ignore
+    # ── 按 R gene_order 顺序重排基因 ────────────────────────────────────────
+    expr_filt = log_expr
+    var_filt = var_gene_order
+    # 后续平滑会按 chromosome/start 重排基因；这里先同步重排矩阵和 var，
+    # 确保 X_{key_added} 的列顺序与 kept_var_names 完全一致。
+    ordered_genes: list[str] = []
+    for chrom in _ordered_chromosomes(var_filt):
+        chrom_genes = (
+            var_filt.loc[var_filt["chromosome"] == chrom]
+            .sort_values("start", kind="mergesort")
+            .index.to_list()
+        )
+        ordered_genes.extend(chrom_genes)
+    order_idx = var_filt.index.get_indexer(ordered_genes)
+    expr_filt = expr_filt[:, order_idx]
+    var_filt = var_filt.loc[ordered_genes, :]
+    logging.info(f"  Genes for smoothing: {expr_filt.shape[1]} / {adata.n_vars}")  # type: ignore
 
     # ── Step 5：按染色体 same-length 滑窗平滑（gene 维输出） ─────────────────
     # 与 R smooth_by_chromosome 一致：每条染色体独立平滑，输出长度 = 该染色体基因数
@@ -266,6 +288,46 @@ def infercnv_r_compat(
         return chr_pos, res
 
 
+def denoise_r_compat(
+    cnv_matrix: np.ndarray | scipy.sparse.spmatrix,
+    ref_mask: np.ndarray,
+    *,
+    sd_amplifier: float = 1.5,
+    noise_logistic: bool = False,
+) -> np.ndarray:
+    """移植 R inferCNV Step 22 `clear_noise_via_ref_mean_sd`。
+
+    R strict cnv_signal 来自 22_denoise infercnv_obj：
+    `colMeans(abs(expr.data - 1))`。HMM proportion 来自 17_HMM_pred，
+    因此这个 denoise 矩阵只用于 continuous score，不回写给 HMM 输入。
+    """
+    if noise_logistic:
+        raise NotImplementedError(
+            "R-compatible logistic denoise is not implemented; "
+            "inferCNV default noise_logistic=FALSE uses hard replacement."
+        )
+
+    x = cnv_matrix.toarray() if scipy.sparse.issparse(cnv_matrix) else np.asarray(cnv_matrix)
+    x = np.asarray(x, dtype=np.float64).copy()
+    ref_mask = np.asarray(ref_mask, dtype=bool)
+    if x.ndim != 2:
+        raise ValueError("cnv_matrix must be a 2D matrix")
+    if ref_mask.shape[0] != x.shape[0]:
+        raise ValueError("ref_mask length must match cnv_matrix rows (cells)")
+    if not ref_mask.any():
+        raise ValueError("ref_mask contains no reference cells")
+
+    ref_vals = x[ref_mask, :]
+    mean_ref_vals = float(np.mean(ref_vals))
+    mean_ref_sd = float(np.mean(np.std(ref_vals, axis=1, ddof=1)) * sd_amplifier)
+    lower_bound = mean_ref_vals - mean_ref_sd
+    upper_bound = mean_ref_vals + mean_ref_sd
+
+    in_noise = (x > lower_bound) & (x < upper_bound)
+    x[in_noise] = mean_ref_vals
+    return x
+
+
 # ── 内部函数 ──────────────────────────────────────────────────────────────────
 
 
@@ -338,14 +400,15 @@ def compute_hspike_emission_params(
     reference_cat: str | Sequence[str] | None = None,
     max_ref_threshold: float = 3.0,
     window_size: int = 101,
-    exclude_chromosomes: Sequence[str] | None = ("chrX", "chrY"),
+    exclude_chromosomes: Sequence[str] | None = ("chrM", "chrMT", "MT", "M"),
     min_mean_expr_cutoff: float = 0.1,
     n_sim_cells: int = 100,
     n_genes_per_chr: int = 400,
     cnv_ratios: tuple[float, ...] = (0.01, 0.5, 1.0, 1.5, 2.0, 3.0),
     output_space: str = "copy_ratio",
     random_state: int = 42,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_sd_trend: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """精确复现 R inferCNV hspike 模拟，计算 HMM 发射参数（单细胞水平）。
 
     v2 关键变更：
@@ -365,6 +428,9 @@ def compute_hspike_emission_params(
     -------
     emit_means : (n_states,) float64 — 各 CNV 状态的 emission 均值（copy_ratio 或 log2 空间）
     emit_stds  : (n_states,) float64 — 各 CNV 状态的 emission 标准差（单细胞水平）
+    sd_intercepts / sd_slopes
+        当 return_sd_trend=True 时额外返回，对应 R
+        lm(log(sd_vals) ~ log(num_cells)) 的截距与斜率。
     """
     import pandas as pd  # noqa: PLC0415
 
@@ -380,25 +446,30 @@ def compute_hspike_emission_params(
         raw_counts = raw_counts.toarray()
     raw_counts = np.asarray(raw_counts, dtype=np.float64)
 
-    ref_raw = raw_counts[ref_mask]               # (n_ref, n_genes)
-
     var_mask_excl = (
         adata.var["chromosome"].isin(list(exclude_chromosomes))
         if exclude_chromosomes is not None
         else pd.Series(False, index=adata.var_names)
     )
-    # 与真实管线保持一致：低表达基因过滤（R `require_above_min_mean_expr_cutoff`）
-    if min_mean_expr_cutoff is not None and min_mean_expr_cutoff > 0:
-        gene_raw_means_full = raw_counts.mean(axis=0)
-        var_mask_lowexpr = pd.Series(
-            gene_raw_means_full < float(min_mean_expr_cutoff),
-            index=adata.var_names,
-        )
-    else:
-        var_mask_lowexpr = pd.Series(False, index=adata.var_names)
+    gene_order_mask = ~(adata.var["chromosome"].isnull() | var_mask_excl)
+    raw_gene_order = raw_counts[:, gene_order_mask.values]
 
-    keep_mask = ~(adata.var["chromosome"].isnull() | var_mask_excl | var_mask_lowexpr)
-    n_genes_total   = int(keep_mask.sum())
+    # 与真实管线保持一致：先限定到 R gene_order 基因池，再做低表达过滤和库容归一化。
+    if min_mean_expr_cutoff is not None and min_mean_expr_cutoff > 0:
+        gene_raw_means = raw_gene_order.mean(axis=0)
+        keep_after_cutoff = gene_raw_means >= float(min_mean_expr_cutoff)
+    else:
+        keep_after_cutoff = np.ones(raw_gene_order.shape[1], dtype=bool)
+
+    raw_pool = raw_gene_order[:, keep_after_cutoff]
+    pool_totals = np.maximum(raw_pool.sum(axis=1, keepdims=True), 1.0)
+    pool_scale_factor = max(float(np.median(raw_pool.sum(axis=1))), 1.0)
+    norm_pool = raw_pool / pool_totals * pool_scale_factor
+
+    # hspike 的 gene means 来自已归一化 infercnv_obj@expr.data；这里再限制到
+    # 后续真实 HMM 会使用的有效染色体基因池，避免用无坐标/排除染色体基因估计发射分布。
+    norm_keep = norm_pool
+    n_genes_total = int(norm_keep.shape[1])
 
     # ── 构建合成基因组（与 R .get_hspike_chr_info 一致）────────────────────
     cnv_chr_defs = [
@@ -444,24 +515,111 @@ def compute_hspike_emission_params(
         f"output_space={output_space}"
     )
 
-    # ── 从真实参考细胞带放回采样合成正常细胞和肿瘤细胞基底 ──────────────────
-    n_ref_cells = ref_raw.shape[0]
-    norm_cell_idx  = rng.integers(0, n_ref_cells, size=n_sim_cells)
-    tumor_cell_idx = rng.integers(0, n_ref_cells, size=n_sim_cells)
+    # ── R sim_method='meanvar'：用 mean-variance trend 重新模拟 counts ─────────
+    # R inferCNV_hidden_spike.R:
+    #   gene_means <- rowMeans(normal_cells_expr)[sampled_genes]
+    #   sim_normal <- .get_simulated_cell_matrix_using_meanvar_trend(..., include.dropout=TRUE)
+    #   sim_tumor  <- same mean-var simulator with hspike_gene_means = gene_means * cnv
+    #
+    # 之前的 Python 版本直接重采样真实 reference counts，会低估 hspike 的模拟方差，
+    # 使 HMM emission 与 R 的 i6 hspike 不同。这里按 R 默认 meanvar 路径移植。
+    from scipy.interpolate import UnivariateSpline  # noqa: PLC0415
 
-    keep_indices   = np.where(keep_mask)[0]
-    sampled_gene_pos = keep_indices[sampled_idx]
+    ref_norm_keep = norm_keep[ref_mask]
+    ref_gene_means = ref_norm_keep.mean(axis=0)
+    gene_means = ref_gene_means[sampled_idx].astype(np.float64)
+    gene_means[gene_means == 0] = 1e-3
 
-    sim_norm       = ref_raw[norm_cell_idx][:, sampled_gene_pos].astype(np.float64)
-    sim_tumor_base = ref_raw[tumor_cell_idx][:, sampled_gene_pos].astype(np.float64)
-    sim_tumor      = sim_tumor_base * gene_ratio_vec[None, :]
+    if reference_key is not None and reference_key in adata.obs.columns:
+        group_values = adata.obs[reference_key].astype(str)
+        group_names = list(dict.fromkeys(group_values.to_list()))
+        group_masks = [(group_values == g).values for g in group_names]
+    else:
+        group_masks = [np.ones(adata.n_obs, dtype=bool)]
 
-    all_sim   = np.vstack([sim_norm, sim_tumor])
-    is_norm   = np.array([True] * n_sim_cells + [False] * n_sim_cells)
+    mean_vals: list[np.ndarray] = []
+    var_vals: list[np.ndarray] = []
+    p0_means: list[np.ndarray] = []
+    p0_vals: list[np.ndarray] = []
+    for gm in group_masks:
+        grp = norm_keep[gm]
+        if grp.shape[0] == 0:
+            continue
+        mean_vals.append(grp.mean(axis=0))
+        var_vals.append(grp.var(axis=0, ddof=1) if grp.shape[0] > 1 else np.zeros(grp.shape[1]))
+        p0_means.append(grp.mean(axis=0))
+        p0_vals.append((grp == 0).mean(axis=0))
+
+    mean_all = np.concatenate(mean_vals)
+    var_all = np.concatenate(var_vals)
+    x_mv = np.log(mean_all + 1.0)
+    y_mv = np.log(np.maximum(var_all, 0.0) + 1.0)
+    finite_mv = np.isfinite(x_mv) & np.isfinite(y_mv)
+    order_mv = np.argsort(x_mv[finite_mv])
+    x_mv = x_mv[finite_mv][order_mv]
+    y_mv = y_mv[finite_mv][order_mv]
+    # smooth.spline 的精确 GCV 在 scipy 中没有一一对应实现；UnivariateSpline 的
+    # 平滑样条保留同一算法意图（log(var+1) ~ log(mean+1)）。
+    k_mv = min(3, max(1, len(np.unique(x_mv)) - 1))
+    mean_var_spline = UnivariateSpline(x_mv, y_mv, k=k_mv, s=len(x_mv))
+
+    p0_mean_all = np.concatenate(p0_means)
+    y_p0_all = np.concatenate(p0_vals)
+    finite_p0 = np.isfinite(p0_mean_all) & np.isfinite(y_p0_all) & (p0_mean_all > 0)
+    x_p0 = np.log(p0_mean_all[finite_p0])
+    y_p0 = y_p0_all[finite_p0]
+    order_p0 = np.argsort(x_p0)
+    x_p0 = x_p0[order_p0]
+    y_p0 = y_p0[order_p0]
+    if len(np.unique(x_p0)) >= 2:
+        k_p0 = min(3, max(1, len(np.unique(x_p0)) - 1))
+        dropout_spline = UnivariateSpline(x_p0, y_p0, k=k_p0, s=len(x_p0))
+    else:
+        dropout_spline = None
+
+    def _simulate_meanvar_counts(means: np.ndarray) -> np.ndarray:
+        means = np.asarray(means, dtype=np.float64)
+        logm = np.log(means + 1.0)
+        pred_log_var = mean_var_spline(logm)
+        var = np.maximum(np.exp(pred_log_var) - 1.0, 0.0)
+        sim = rng.normal(
+            loc=means[None, :],
+            scale=np.sqrt(var)[None, :],
+            size=(n_sim_cells, means.size),
+        )
+        sim = np.rint(np.maximum(sim, 0.0)).astype(np.float64)
+
+        if dropout_spline is not None:
+            gene_mean = sim.mean(axis=0)
+            dropout_prob = np.zeros(means.size, dtype=np.float64)
+            positive_mean = gene_mean > 0
+            if positive_mean.any():
+                dropout_prob[positive_mean] = np.asarray(
+                    dropout_spline(np.log(gene_mean[positive_mean])),
+                    dtype=np.float64,
+                )
+            dropout_prob = np.clip(np.nan_to_num(dropout_prob, nan=0.0), 0.0, 1.0)
+            n_zero = (sim == 0).sum(axis=0)
+            n_remaining = n_sim_cells - n_zero
+            padj = np.zeros(means.size, dtype=np.float64)
+            valid = n_remaining > 0
+            padj[valid] = ((dropout_prob[valid] * n_sim_cells) - n_zero[valid]) / n_remaining[valid]
+            padj = np.clip(np.nan_to_num(padj, nan=0.0), 0.0, 1.0)
+            drop_mask = rng.random(sim.shape) <= padj[None, :]
+            sim[drop_mask] = 0.0
+        return sim
+
+    sim_norm = _simulate_meanvar_counts(gene_means)
+    sim_tumor = _simulate_meanvar_counts(gene_means * gene_ratio_vec)
+
+    all_sim = np.vstack([sim_norm, sim_tumor])
+    is_norm = np.array([True] * n_sim_cells + [False] * n_sim_cells)
 
     # ── 完整 R 管线（8 步，与 infercnv_r_compat 一致）──────────────────────
     totals  = np.maximum(all_sim.sum(axis=1, keepdims=True), 1.0)
-    sf      = max(float(np.median(all_sim.sum(axis=1))), 1.0)
+    # R: normalize_counts_by_seq_depth(.hspike, median(colSums(normal_cells_expr)))
+    # 其中 normal_cells_expr 已是原 infercnv_obj 归一化后的参考表达矩阵。
+    sf      = pool_scale_factor
     sim_log = np.log1p(all_sim / totals * sf) / math.log(2)
 
     sim_log = _subtract_ref_bounds(sim_log, is_norm)
@@ -498,12 +656,15 @@ def compute_hspike_emission_params(
 
     emit_means_list: list[float] = []
     emit_stds_list:  list[float] = []
+    vals_by_state: list[np.ndarray] = []
     tumor_mask = ~is_norm
 
     for ratio in cnv_ratios:
         if ratio == 1.0:
             vals_list = []
-            for cn in neutral_chr_list[:2]:
+            # R .get_gene_expr_by_cnv() 按 cnv key 合并所有 cnv:1 染色体，
+            # 包括 chrA..chrE 以及可变长度 chr_F；不能只抽前两个 neutral chr。
+            for cn in neutral_chr_list:
                 if cn in chr_ranges:
                     ws, we = chr_ranges[cn]
                     vals_list.append(x_final[tumor_mask, ws:we].ravel())
@@ -518,8 +679,10 @@ def compute_hspike_emission_params(
 
         if len(vals) == 0:
             vals = np.full(10, neutral_anchor)
+        vals = np.asarray(vals, dtype=np.float64)
+        vals_by_state.append(vals)
         emit_means_list.append(float(np.mean(vals)))
-        emit_stds_list.append(float(np.std(vals)))
+        emit_stds_list.append(float(np.std(vals, ddof=1)) if vals.size > 1 else 1e-5)
         logging.info(  # type: ignore
             f"  hspike ratio={ratio}: chr={ratio_to_chr.get(ratio, 'neutral')}, "
             f"n_vals={len(vals)}, mean={emit_means_list[-1]:.5f}, "
@@ -529,8 +692,42 @@ def compute_hspike_emission_params(
     emit_means = np.array(emit_means_list, dtype=np.float64)
     emit_stds  = np.maximum(np.array(emit_stds_list, dtype=np.float64), 1e-5)
 
+    sd_intercepts = np.zeros_like(emit_stds)
+    sd_slopes = np.zeros_like(emit_stds)
+    if return_sd_trend:
+        nrounds = 100
+        num_cells_grid = np.arange(1, 101, dtype=np.float64)
+        for state_idx, vals in enumerate(vals_by_state):
+            sd_vals = np.full(num_cells_grid.shape, np.nan, dtype=np.float64)
+            for grid_idx, ncells in enumerate(num_cells_grid.astype(int)):
+                # R:
+                # vals <- replicate(nrounds, sample(expr_vals, size=ncells, replace=TRUE))
+                # means <- Matrix::rowMeans(vals)  # 注意是 rowMeans，不是 colMeans
+                sampled = rng.choice(vals, size=(ncells, nrounds), replace=True)
+                means = sampled.mean(axis=1)
+                sd_vals[grid_idx] = np.std(means, ddof=1) if means.size > 1 else np.nan
+
+            valid_fit = np.isfinite(sd_vals) & (sd_vals > 0)
+            if valid_fit.sum() >= 2:
+                slope, intercept = np.polyfit(
+                    np.log(num_cells_grid[valid_fit]),
+                    np.log(sd_vals[valid_fit]),
+                    deg=1,
+                )
+                sd_intercepts[state_idx] = float(intercept)
+                sd_slopes[state_idx] = float(slope)
+            else:
+                sd_intercepts[state_idx] = float(np.log(max(emit_stds[state_idx], 1e-5)))
+                sd_slopes[state_idx] = -0.5
+
     logging.info(  # type: ignore
         f"compute_hspike_emission_params done [{output_space}]: "
         f"means={np.round(emit_means, 4)}, stds={np.round(emit_stds, 4)}"
     )
+    if return_sd_trend:
+        logging.info(  # type: ignore
+            "compute_hspike_emission_params sd trend: "
+            f"intercepts={np.round(sd_intercepts, 4)}, slopes={np.round(sd_slopes, 4)}"
+        )
+        return emit_means, emit_stds, sd_intercepts, sd_slopes
     return emit_means, emit_stds

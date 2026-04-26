@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- 新增 `template/` 调用示例目录，提供 R-compatible 分析、可视化，以及可选的
+  R inferCNV 对照 benchmark 脚本，方便外部用户按 AnnData + GTF 独立运行
+  `cnvturbo`，不依赖 R inferCNV 结果。
+- `io.genomic_position_from_gtf(gtf_gene_id="auto")` 支持先按 `gene_name`
+  匹配，再用去版本号的 `gene_id` 补齐未匹配基因，并保留 GTF 染色体顺序。
+- 新增 `tl.denoise_r_compat`，移植 R inferCNV Step 22
+  `clear_noise_via_ref_mean_sd`，用于计算与 R `cnv_signal_R` 对齐的
+  strict 连续信号。
+
+### Changed
+- `tl.infercnv_r_compat` 将 no-coordinate / excluded chromosome / low-expression
+  基因过滤前移到 library-size normalization 之前，对齐 R inferCNV 初始对象的
+  gene pool 语义；染色体内排序改为稳定排序，避免同起点基因顺序漂移。
+- `tl.compute_hspike_emission_params` 对齐 R `sim_method="meanvar"` hidden-spike
+  模拟，返回可选 SD trend 参数供 subcluster HMM 按细胞数缩放 emission 方差。
+- `tl.hmm_call_subclusters` 对齐 R inferCNV subcluster 逻辑：按 annotation group
+  分别 Leiden、支持 R-style z-score gene filter、CPM/Seurat SNN 图构建，并将
+  `{key_added}_score` 定义为 HMM non-neutral state fraction。
+- README benchmark 更新为 40 样本验证结果：region-level CNV 100% 一致，
+  strict cell-level F1=0.980，per-cell `cnv_score` mean Pearson=0.99997。
+- 移除继承自 infercnvpy 风格的 legacy pytest 测试目录与 pytest 配置，避免将旧
+  `tl.infercnv` 测试误解为当前 R-compatible 主路径的验证依据。
+
 ### Documentation
 - 修订 `README.md` 与 `pyproject.toml` 中关于 GPU / Numba 加速的描述，明确后端
   覆盖范围，避免读者误以为 R-兼容主路径享受 GPU 加速：

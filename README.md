@@ -22,9 +22,9 @@
 | Reference subcluster handling | ✓ | partial | ✓ |
 | GPU / Numba acceleration | ✗ | ✗ | ✓ (legacy `tl.infercnv` + `tl.hmm_call_cells`; R-exact path is CPU + joblib) |
 | Runtime (P12, 7,269 cells) | **~5 hr** | ~9 min | **~86 s** |
-| Cell-level concordance with R | 1.000 (ref) | N/A (no cell-level HMM) | **1.000** |
+| Strict Tumor/Normal concordance with R | 1.000 (ref) | N/A (no cell-level HMM) | **F1 0.980** |
 
-Verified on 3 PDAC samples (15,135 cells total): **cell-level Tumor/Normal classification 100% identical to R inferCNV's HMM output**, while running 100–200× faster on CPU alone. See [Benchmark](#benchmark) below.
+Verified on 40 PDAC samples (99,679 observation cells): **region-level CNV calls are 100% identical to R inferCNV**, strict cell-level Tumor/Normal calls reach **overall F1 = 0.980**, and per-cell continuous `cnv_score` matches R `cnv_signal_R` with mean Pearson **0.99997**. See [Benchmark](#benchmark) below.
 
 > **Speed-up attribution**: the R-exact main pipeline (`infercnv_r_compat` +
 > `compute_hspike_emission_params` + `hmm_call_subclusters`) is **CPU + joblib only**.
@@ -101,13 +101,14 @@ cnv_tl.infercnv_r_compat(
     n_jobs=16,
 )
 
-emit_means, emit_stds = cnv_tl.compute_hspike_emission_params(
+emit_means, emit_stds, emit_sd_intercepts, emit_sd_slopes = cnv_tl.compute_hspike_emission_params(
     adata,
     raw_layer="counts",
     reference_key="cell_type",
     reference_cat=["NK", "Endothelial", "Fibroblast"],
     min_mean_expr_cutoff=0.1,    # 必须与 infercnv_r_compat 保持一致
     output_space="copy_ratio",
+    return_sd_trend=True,
 )
 
 cnv_tl.hmm_call_subclusters(
@@ -117,6 +118,8 @@ cnv_tl.hmm_call_subclusters(
     reference_cat=["NK", "Endothelial", "Fibroblast"],
     precomputed_emit_means=emit_means,
     precomputed_emit_stds=emit_stds,
+    precomputed_emit_sd_intercepts=emit_sd_intercepts,
+    precomputed_emit_sd_slopes=emit_sd_slopes,
     leiden_resolution="auto",
     cluster_by_groups=True,
     min_segment_length=5,
@@ -128,7 +131,23 @@ cnv_tl.hmm_call_subclusters(
 print(adata.obs["cnv_call"].value_counts())
 ```
 
-After this, `adata.obs["cnv_call"]` contains `"Tumor"` / `"Normal"` per cell, and `adata.obs["cnv_call_score"]` carries a continuous CNV burden score (`mean(|X_cnv − 1.0|)` in copy-ratio space).
+After this, `adata.obs["cnv_call"]` contains `"Tumor"` / `"Normal"` per cell, and `adata.obs["cnv_call_score"]` stores the HMM non-neutral state fraction (`proportion_cnv`).
+
+For strict R-equivalent cell-level calls, combine the HMM burden with a continuous denoised CNV signal:
+
+```python
+ref_mask = adata.obs["cell_type"].isin(["NK", "Endothelial", "Fibroblast"]).to_numpy()
+x_denoise = cnv_tl.denoise_r_compat(adata.obsm["X_cnv"], ref_mask)
+adata.obs["cnv_score"] = np.mean(np.abs(x_denoise - 1.0), axis=1)
+adata.obs["proportion_cnv"] = adata.obs["cnv_call_score"].astype(float)
+adata.obs["is_obs_tumor"] = (
+    (~ref_mask)
+    & (adata.obs["cnv_score"] > np.percentile(adata.obs.loc[ref_mask, "cnv_score"], 95))
+    & (adata.obs["proportion_cnv"] > np.percentile(adata.obs.loc[ref_mask, "proportion_cnv"], 95))
+)
+```
+
+End-to-end reusable scripts are available in [`template/`](template/).
 
 ---
 
@@ -195,7 +214,7 @@ Output:
 Mirrors R's `hidden_spike` simulation: builds a synthetic genome (50% CNV / 50% neutral chromosomes), samples the simulation base from real reference cells, runs the full pipeline, and extracts emission parameters per CNV state.
 
 ```python
-emit_means, emit_stds = cnv_tl.compute_hspike_emission_params(
+emit_means, emit_stds, emit_sd_intercepts, emit_sd_slopes = cnv_tl.compute_hspike_emission_params(
     adata,
     raw_layer="counts",
     reference_key="cell_type",
@@ -204,6 +223,7 @@ emit_means, emit_stds = cnv_tl.compute_hspike_emission_params(
     n_sim_cells=100,
     n_genes_per_chr=400,
     output_space="copy_ratio",
+    return_sd_trend=True,
 )
 ```
 
@@ -219,8 +239,13 @@ cnv_tl.hmm_call_subclusters(
     reference_cat=["NK", "Endothelial"],
     precomputed_emit_means=emit_means,
     precomputed_emit_stds=emit_stds,
+    precomputed_emit_sd_intercepts=emit_sd_intercepts,
+    precomputed_emit_sd_slopes=emit_sd_slopes,
     leiden_resolution="auto",
     cluster_by_groups=True,
+    z_score_filter=0.8,
+    leiden_function="CPM",
+    leiden_graph_method="seurat_snn",
     n_neighbors=20,
     n_pcs=10,
     min_segment_length=5,
@@ -234,7 +259,8 @@ cnv_tl.hmm_call_subclusters(
 
 Output (added to `adata.obs`):
 * `cnv_call` — `"Tumor"` / `"Normal"` per cell
-* `cnv_call_score` — continuous CNV burden (`mean(|X_cnv − 1.0|)`)
+* `cnv_call_score` — HMM non-neutral state fraction (`proportion_cnv`)
+* `cnv_call_expr_deviation` — raw expression deviation (`mean(|X_cnv − 1.0|)`)
 * `cnv_call_subcluster` — Leiden subcluster id used for HMM
 
 ### 5. Visualization
@@ -252,17 +278,21 @@ sc.pl.embedding(adata, basis="cnv_umap", color=["cnv_call", "cnv_call_score"])
 
 ## Benchmark
 
-Three pancreatic adenocarcinoma samples (P07 = 3,659 cells, P12 = 7,269 cells, P30 = 4,207 cells); reference group = NK + Endothelial + Fibroblast (~50% of all cells).
+Pancreatic adenocarcinoma benchmark, 40 samples, 99,679 observation cells; reference group = NK / T-like normal cells depending on sample annotation. R inferCNV outputs were used only for validation, not as cnvturbo inputs.
 
-| Sample | R inferCNV (runtime) | cnvturbo (runtime) | Speed-up | cnvturbo cell-level Accuracy vs R |
-|---|---|---|---|---|
-| P07CRX_T (3,659) | 2.5 h | 64 s | **140×** | **1.000** |
-| P12HWZ_T (7,269) | 5.0 h | 86 s | **210×** | **1.000** |
-| P30WJJ_T (4,207) | 3.5 h | 54 s | **230×** | **1.000** |
+| Metric | Result |
+|---|---:|
+| Region-level CNV call accuracy vs R | **1.000** |
+| Region-level CNV call F1 vs R | **1.000** |
+| Strict cell-level Tumor/Normal accuracy vs R | **0.986** |
+| Strict cell-level Tumor/Normal precision vs R | **0.976** |
+| Strict cell-level Tumor/Normal recall vs R | **0.984** |
+| Strict cell-level Tumor/Normal F1 vs R | **0.980** |
+| Per-cell `cnv_score` mean Pearson vs R `cnv_signal_R` | **0.99997** |
+| Per-cell `cnv_score` max RMSE vs R `cnv_signal_R` | **1.24e-4** |
 
-cnvturbo's per-cell `Tumor` / `Normal` classification is **identical** to R inferCNV's HMM output across all 15,135 cells.
-
-> The "ground truth" was reconstructed directly from R's `pred_cnv_regions.dat` + `cell_groupings` to bypass a known fuzzy-match bug in some user post-processing scripts.
+The strict call is the dual-gate rule used by the templates:
+`cnv_score > P95(reference)` and `proportion_cnv > P95(reference)`.
 
 ---
 

@@ -7,7 +7,7 @@ from scanpy import logging
 
 from ._copykat import copykat
 from ._hmm import hmm_call_cells, hmm_call_subclusters
-from ._infercnv_r import compute_hspike_emission_params
+from ._infercnv_r import compute_hspike_emission_params, denoise_r_compat
 from ._infercnv import infercnv
 from ._infercnv_r import infercnv_r_compat
 from ._scores import cnv_score, cnv_score_cell, ithcna, ithgex
