@@ -234,6 +234,186 @@ def _viterbi_r_batch(
     return states
 
 
+def _run_leiden_r_compatible(
+    adata_tmp: AnnData,
+    *,
+    resolution: float,
+    objective_function: str,
+    random_state: int,
+    key_added: str,
+) -> None:
+    """在 Scanpy neighbors 图上运行尽量贴近 R igraph::cluster_leiden 的 Leiden。
+
+    R inferCNV 默认使用 Seurat SNN 图 + igraph::cluster_leiden(objective_function="CPM")。
+    Python 侧复用 Scanpy 生成的加权邻接图，并显式调用 leidenalg 的 CPM/RB
+    partition，避免 scanpy 默认 modularity 目标函数造成 resolution 尺度偏移。
+    """
+    try:
+        import igraph as ig  # noqa: PLC0415
+        import leidenalg  # noqa: PLC0415
+        import pandas as pd  # noqa: PLC0415
+
+        graph = adata_tmp.obsp["connectivities"].tocoo()
+        keep = graph.row < graph.col
+        edges = list(zip(graph.row[keep].tolist(), graph.col[keep].tolist(), strict=False))
+        weights = graph.data[keep].astype(float).tolist()
+
+        if len(edges) == 0:
+            adata_tmp.obs[key_added] = pd.Categorical(["0"] * adata_tmp.n_obs)
+            return
+
+        ig_graph = ig.Graph(n=adata_tmp.n_obs, edges=edges, directed=False)
+        if objective_function == "CPM":
+            partition_type = leidenalg.CPMVertexPartition
+        else:
+            partition_type = leidenalg.RBConfigurationVertexPartition
+
+        partition = leidenalg.find_partition(
+            ig_graph,
+            partition_type,
+            weights=weights,
+            resolution_parameter=float(resolution),
+            seed=int(random_state),
+        )
+        adata_tmp.obs[key_added] = pd.Categorical([str(x) for x in partition.membership])
+    except Exception as exc:
+        import scanpy as sc  # noqa: PLC0415
+
+        logging.warning(  # type: ignore
+            f"R-compatible Leiden failed ({exc}); falling back to scanpy.tl.leiden"
+        )
+        sc.tl.leiden(
+            adata_tmp,
+            resolution=float(resolution),
+            random_state=random_state,
+            key_added=key_added,
+        )
+
+
+def _build_seurat_snn_connectivities(
+    X_pca: np.ndarray,
+    *,
+    n_neighbors: int,
+    prune_snn: float = 1.0 / 15.0,
+) -> scipy.sparse.csr_matrix:
+    """构建 Seurat FindNeighbors 风格的 SNN/Jaccard 加权图。
+
+    R inferCNV 的 Leiden 默认走 Seurat PCA + SNN 图；Scanpy 的 neighbors
+    默认生成 UMAP fuzzy connectivities，CPM resolution 尺度会明显偏移。这里
+    直接按共享最近邻 Jaccard 权重构图，并应用 Seurat 默认 prune.SNN=1/15。
+    """
+    from sklearn.neighbors import NearestNeighbors  # noqa: PLC0415
+
+    n_obs = int(X_pca.shape[0])
+    if n_obs <= 1:
+        return scipy.sparse.csr_matrix((n_obs, n_obs), dtype=np.float32)
+
+    # RANN::nn2(..., k=k_nn) 与 Seurat neighbor ranks 通常把 query cell 自身
+    # 作为最近邻纳入 k 个邻居；SNN Jaccard 权重应保留这个语义。
+    k = max(1, min(int(n_neighbors), n_obs))
+    nn = NearestNeighbors(n_neighbors=k, metric="euclidean")
+    nn.fit(X_pca)
+    raw_indices = nn.kneighbors(return_distance=False)
+
+    rows_knn: list[int] = []
+    cols_knn: list[int] = []
+    for i, row in enumerate(raw_indices):
+        clean = [int(j) for j in row]
+        if i not in clean:
+            clean = [i] + clean
+        clean = clean[:k]
+        rows_knn.extend([i] * len(clean))
+        cols_knn.extend(clean)
+
+    knn = scipy.sparse.csr_matrix(
+        (
+            np.ones(len(rows_knn), dtype=np.float32),
+            (np.asarray(rows_knn), np.asarray(cols_knn)),
+        ),
+        shape=(n_obs, n_obs),
+        dtype=np.float32,
+    )
+    shared = (knn @ knn.T).tocoo()
+
+    row_degree = np.asarray(knn.sum(axis=1)).ravel()
+    denom = row_degree[shared.row] + row_degree[shared.col] - shared.data
+    keep = (shared.row != shared.col) & (denom > 0)
+    weights = np.zeros_like(shared.data, dtype=np.float32)
+    weights[keep] = shared.data[keep] / denom[keep]
+    keep &= weights > float(prune_snn)
+
+    return scipy.sparse.csr_matrix(
+        (weights[keep], (shared.row[keep], shared.col[keep])),
+        shape=(n_obs, n_obs),
+        dtype=np.float32,
+    )
+
+
+def _seurat_vst_scale_pca(
+    X: np.ndarray,
+    *,
+    n_pcs: int,
+    random_state: int,
+    n_variable_features: int = 2000,
+) -> np.ndarray:
+    """近似移植 Seurat FindVariableFeatures + ScaleData + RunPCA。
+
+    R inferCNV 调用 Seurat 时先 `FindVariableFeatures(selection.method="vst")`，
+    随后对所有基因 `ScaleData(layer="counts")`，但 `RunPCA()` 默认只使用
+    VariableFeatures。这里按 VST 思路用 log(mean)-log(var) 趋势得到标准化
+    方差，再选 top features 并做 z-score PCA。
+    """
+    from sklearn.decomposition import PCA  # noqa: PLC0415
+
+    X = np.asarray(X, dtype=np.float64)
+    n_obs, n_vars = X.shape
+    if n_vars == 0:
+        return np.zeros((n_obs, 1), dtype=np.float64)
+
+    gene_mean = X.mean(axis=0)
+    gene_var = X.var(axis=0, ddof=1)
+    valid = (gene_mean > 0) & (gene_var > 0) & np.isfinite(gene_mean) & np.isfinite(gene_var)
+    standardized_var = gene_var.copy()
+    if valid.sum() >= 10:
+        from scipy.interpolate import UnivariateSpline  # noqa: PLC0415
+
+        x_fit = np.log10(gene_mean[valid])
+        y_fit = np.log10(gene_var[valid])
+        order = np.argsort(x_fit)
+        x_fit = x_fit[order]
+        y_fit = y_fit[order]
+        k_spline = min(3, max(1, len(np.unique(x_fit)) - 1))
+        try:
+            trend = UnivariateSpline(x_fit, y_fit, k=k_spline, s=len(x_fit))
+            expected_var = np.power(10.0, trend(np.log10(np.maximum(gene_mean, 1e-12))))
+            expected_sd = np.sqrt(np.maximum(expected_var, 1e-12))
+            z = (X - gene_mean[None, :]) / expected_sd[None, :]
+            clip_max = math.sqrt(n_obs)
+            z = np.clip(z, -clip_max, clip_max)
+            standardized_var = z.var(axis=0, ddof=1)
+        except Exception as exc:
+            logging.warning(  # type: ignore
+                f"Seurat VST variable feature approximation failed ({exc}); "
+                "falling back to raw variance"
+            )
+
+    n_feat = min(int(n_variable_features), n_vars)
+    if n_feat < n_vars:
+        feature_idx = np.argpartition(standardized_var, -n_feat)[-n_feat:]
+        feature_idx = feature_idx[np.argsort(standardized_var[feature_idx])[::-1]]
+        X_use = X[:, feature_idx]
+    else:
+        X_use = X
+
+    X_use = X_use - X_use.mean(axis=0, keepdims=True)
+    sd = X_use.std(axis=0, ddof=1, keepdims=True)
+    X_use = X_use / np.where(sd > 0, sd, 1.0)
+    np.clip(X_use, -10.0, 10.0, out=X_use)
+
+    n_comp = max(1, min(int(n_pcs), X_use.shape[1], n_obs - 1))
+    return PCA(n_components=n_comp, random_state=random_state).fit_transform(X_use)
+
+
 # ── R denoise 等价：HMM 状态序列段长过滤 ─────────────────────────────────────
 
 
@@ -302,6 +482,41 @@ def _count_cnv_segments(
     return n_seg
 
 
+def _infercnv_r_leiden_gene_mask(
+    cnv_matrix: np.ndarray,
+    ref_mask: np.ndarray,
+    z_score_filter: float,
+) -> np.ndarray:
+    """返回 R inferCNV tumor_subclusters z_score 语义下的 Leiden 基因保留掩码。
+
+    输入矩阵为 cells x genes。R 源码对 genes x ref_cells 的 `ref_matrix`
+    执行 `(ref_matrix - mean(ref_matrix)) / sd(ref_matrix)`，再按 gene 计算
+    `mean(abs(z_score))` 并过滤 `>= z_score_filter` 的 outlier genes。
+
+    注意：R 的 `sd(matrix)` 会把矩阵当作向量处理，使用全矩阵样本 sd 标量，
+    不是按 reference cell 分别计算 sd。
+    """
+    n_genes = cnv_matrix.shape[1]
+    keep_all = np.ones(n_genes, dtype=bool)
+    if z_score_filter <= 0 or not ref_mask.any():
+        return keep_all
+
+    ref_matrix = np.asarray(cnv_matrix[ref_mask], dtype=np.float64)
+    if ref_matrix.size < 2:
+        return keep_all
+
+    ref_mean = float(np.mean(ref_matrix))
+    ref_sd = float(np.std(ref_matrix, ddof=1))
+    if not np.isfinite(ref_mean) or not np.isfinite(ref_sd) or ref_sd <= 0:
+        return keep_all
+
+    z_score = (ref_matrix - ref_mean) / ref_sd
+    mean_abs_z = np.mean(np.abs(z_score), axis=0)
+    if not np.all(np.isfinite(mean_abs_z)):
+        return keep_all
+    return mean_abs_z < float(z_score_filter)
+
+
 # ── 公开 API ──────────────────────────────────────────────────────────────────
 
 
@@ -317,6 +532,10 @@ def hmm_call_subclusters(
     min_segments_for_tumor: int = _DEFAULT_MIN_SEGMENTS_FOR_TUMOR,
     leiden_resolution: float | str = "auto",
     cluster_by_groups: bool = True,
+    subcluster_key: str | None = None,
+    z_score_filter: float = 0.8,
+    leiden_function: str = "CPM",
+    leiden_graph_method: str = "scanpy",
     n_neighbors: int = 20,
     n_pcs: int = 10,
     fit_method: str = "hspike",
@@ -324,6 +543,8 @@ def hmm_call_subclusters(
     use_r_viterbi: bool = True,
     precomputed_emit_means: np.ndarray | None = None,
     precomputed_emit_stds: np.ndarray | None = None,
+    precomputed_emit_sd_intercepts: np.ndarray | None = None,
+    precomputed_emit_sd_slopes: np.ndarray | None = None,
     backend: str = "auto",
     key_added: str = "cnv_tumor_call",
     n_jobs: int | None = None,
@@ -334,7 +555,7 @@ def hmm_call_subclusters(
     """R inferCNV analysis_mode="subclusters" 精确对标实现（v2）。
 
     与 R inferCNV 的完整对应关系（R/inferCNV_HMM.R + inferCNV_tumor_subclusters.R）：
-      1. Leiden 聚类（按 cluster_by_groups 选择是否分组），分辨率默认 "auto"
+      1. Leiden 聚类（按 reference_key 的每个注释组分别分群），分辨率默认 "auto"
          R: leiden_resolution_auto = (11.98 / n_cells) ^ (1/1.165)
          PCA(n_pcs=10) → kNN(n_neighbors=20)
       2. 每个亚克隆内 rowMeans 计算 **基因级**均值 CNV 谱
@@ -366,8 +587,21 @@ def hmm_call_subclusters(
     leiden_resolution
         Leiden 分辨率：数值或 "auto"（按 R 公式）。
     cluster_by_groups
-        True（R 默认）：按 reference_cat 分组分别 leiden（参考组与观测组独立聚类）。
+        True（R 默认）：按 reference_key 中每个注释组分别 Leiden。
         False：所有细胞一起聚类。
+    subcluster_key
+        可选的预定义 subcluster 列名。设置后跳过 Leiden，直接使用该列作为
+        subcluster 标签；用于严格 replay R `cell_groupings` 以定位差异来源。
+    z_score_filter
+        R inferCNV 默认 0.8。基于 reference 细胞的全局 z-score 过滤用于
+        Leiden subclustering 的高波动基因；只影响 subcluster 定义，不影响 HMM
+        输入矩阵本身。
+    leiden_function
+        Leiden 目标函数，默认 "CPM" 以对齐 R inferCNV。
+    leiden_graph_method
+        "scanpy" 使用 Scanpy neighbors connectivities；"seurat_snn" 使用
+        Seurat 风格 SNN/Jaccard 图。后者目前主要用于与 R subclustering 做
+        中间层对照，不作为默认结论路径。
     n_neighbors
         kNN 邻居数（R 默认 20）。
     n_pcs
@@ -407,56 +641,139 @@ def hmm_call_subclusters(
 
     # ── 2. Leiden 聚类（与 R cluster_by_groups + auto resolution 等价）─────────
     def _r_auto_resolution(n_cells: int) -> float:
-        # R: leiden_resolution_auto = (11.98 / n_cells) ^ (1/1.165)
+        # R: leiden_resolution_auto = (11.98 / n_cells) ^ (1 / 1.165)
         return float(np.power(max(11.98 / max(n_cells, 1), 1e-6), 1.0 / 1.165))
 
-    leiden_labels = np.empty(n_cells_total, dtype=object)
+    leiden_function = str(leiden_function).upper()
+    if leiden_function not in {"CPM", "MODULARITY"}:
+        raise ValueError("leiden_function must be 'CPM' or 'modularity'")
 
-    if cluster_by_groups and ref_mask.any() and (~ref_mask).any():
-        groups_to_cluster = [("Reference", ref_mask), ("Observation", ~ref_mask)]
-    else:
-        groups_to_cluster = [("All", np.ones(n_cells_total, dtype=bool))]
-
-    cluster_id_offset = 0
-    for grp_name, grp_mask in groups_to_cluster:
-        n_grp = int(grp_mask.sum())
-        if n_grp < 3:
-            for cid_local, idx in enumerate(np.where(grp_mask)[0]):
-                leiden_labels[idx] = f"{grp_name}_{cluster_id_offset + cid_local}"
-            cluster_id_offset += n_grp
-            continue
-
-        res_grp = (
-            _r_auto_resolution(n_grp)
-            if leiden_resolution == "auto"
-            else float(leiden_resolution)
+    # R define_signif_tumor_subclusters() 先用 reference 矩阵的 z-score 过滤
+    # subclustering 基因；infercnv_obj 本身不删基因，后续 HMM 仍跑全矩阵。
+    if z_score_filter and z_score_filter > 0 and ref_mask.any():
+        leiden_gene_mask = _infercnv_r_leiden_gene_mask(
+            cnv_matrix=cnv_matrix,
+            ref_mask=ref_mask,
+            z_score_filter=float(z_score_filter),
         )
-        n_pcs_grp = max(1, min(n_pcs, cnv_matrix.shape[1] - 1, n_grp - 1))
-        n_neighbors_grp = max(2, min(n_neighbors, n_grp - 1))
-
-        import anndata as _ad
-        sub_X = scipy.sparse.csr_matrix(cnv_matrix[grp_mask])
-        tmp = _ad.AnnData(X=sub_X)
-        sc.tl.pca(tmp, n_comps=n_pcs_grp, random_state=random_state)
-        sc.pp.neighbors(
-            tmp, n_neighbors=n_neighbors_grp, use_rep="X_pca", random_state=random_state
-        )
-        sc.tl.leiden(
-            tmp, resolution=res_grp, random_state=random_state, key_added="leiden_cnv"
-        )
-        sub_labels = tmp.obs["leiden_cnv"].values
-        unique_sub = np.unique(sub_labels)
-        sub_to_global = {
-            s: f"{grp_name}_{cluster_id_offset + i}" for i, s in enumerate(unique_sub)
-        }
-        for idx_local, idx_global in enumerate(np.where(grp_mask)[0]):
-            leiden_labels[idx_global] = sub_to_global[sub_labels[idx_local]]
-        cluster_id_offset += len(unique_sub)
-
         logging.info(  # type: ignore
-            f"  Leiden [{grp_name}]: n={n_grp}, resolution={res_grp:.4f}, "
-            f"n_pcs={n_pcs_grp}, k={n_neighbors_grp}, n_clusters={len(unique_sub)}"
+            f"  Leiden z_score_filter={z_score_filter}: "
+            f"filtered {(~leiden_gene_mask).sum()} / {cnv_matrix.shape[1]} genes"
         )
+    else:
+        leiden_gene_mask = np.ones(cnv_matrix.shape[1], dtype=bool)
+
+    cnv_for_leiden = cnv_matrix[:, leiden_gene_mask]
+    if cnv_for_leiden.shape[1] < 2:
+        logging.warning(  # type: ignore
+            "Leiden z_score_filter left <2 genes; falling back to all HMM genes"
+        )
+        cnv_for_leiden = cnv_matrix
+
+    if subcluster_key is not None:
+        if subcluster_key not in adata.obs.columns:
+            raise KeyError(f"subcluster_key={subcluster_key!r} not found in adata.obs")
+        leiden_labels = adata.obs[subcluster_key].astype(str).values.astype(object)
+        logging.info(  # type: ignore
+            f"Using precomputed subclusters from obs[{subcluster_key!r}]: "
+            f"{len(np.unique(leiden_labels))} subclusters"
+        )
+    else:
+        leiden_graph_method = str(leiden_graph_method).lower()
+        if leiden_graph_method not in {"scanpy", "seurat_snn"}:
+            raise ValueError("leiden_graph_method must be 'scanpy' or 'seurat_snn'")
+
+        leiden_labels = np.empty(n_cells_total, dtype=object)
+
+        if cluster_by_groups and reference_key is not None and reference_key in adata.obs.columns:
+            obs_group_values = adata.obs[reference_key].astype(str)
+            ref_cats = (
+                {reference_cat}
+                if isinstance(reference_cat, str)
+                else set(reference_cat or [])
+            )
+            seen_groups: list[str] = []
+            for value in obs_group_values:
+                if value not in seen_groups:
+                    seen_groups.append(value)
+            ordered_groups = [g for g in seen_groups if g not in ref_cats] + [
+                g for g in seen_groups if g in ref_cats
+            ]
+            groups_to_cluster = [
+                (grp_name, (obs_group_values == grp_name).values)
+                for grp_name in ordered_groups
+            ]
+        else:
+            groups_to_cluster = [("All", np.ones(n_cells_total, dtype=bool))]
+
+        cluster_id_offset = 0
+        for grp_name, grp_mask in groups_to_cluster:
+            n_grp = int(grp_mask.sum())
+            if n_grp < 3:
+                for cid_local, idx in enumerate(np.where(grp_mask)[0]):
+                    leiden_labels[idx] = f"{grp_name}_{cluster_id_offset + cid_local}"
+                cluster_id_offset += n_grp
+                continue
+            if n_neighbors >= n_grp:
+                leiden_labels[grp_mask] = f"{grp_name}_{cluster_id_offset}"
+                cluster_id_offset += 1
+                logging.info(  # type: ignore
+                    f"  Leiden [{grp_name}]: n={n_grp} <= k={n_neighbors}; "
+                    "kept as one subcluster"
+                )
+                continue
+
+            res_grp = (
+                _r_auto_resolution(n_grp)
+                if leiden_resolution == "auto"
+                else float(leiden_resolution)
+            )
+            n_pcs_grp = max(1, min(n_pcs, cnv_for_leiden.shape[1] - 1, n_grp - 1))
+            n_neighbors_grp = max(2, min(n_neighbors, n_grp - 1))
+
+            import anndata as _ad
+            sub_X = scipy.sparse.csr_matrix(cnv_for_leiden[grp_mask])
+            tmp = _ad.AnnData(X=sub_X)
+            if leiden_graph_method == "seurat_snn":
+                tmp.obsm["X_pca"] = _seurat_vst_scale_pca(
+                    cnv_for_leiden[grp_mask],
+                    n_pcs=n_pcs_grp,
+                    random_state=random_state,
+                )
+                tmp.obsp["connectivities"] = _build_seurat_snn_connectivities(
+                    np.asarray(tmp.obsm["X_pca"], dtype=np.float64),
+                    n_neighbors=n_neighbors_grp,
+                    prune_snn=1.0 / 15.0,
+                )
+            else:
+                sc.tl.pca(tmp, n_comps=n_pcs_grp, random_state=random_state)
+                sc.pp.neighbors(
+                    tmp,
+                    n_neighbors=n_neighbors_grp,
+                    use_rep="X_pca",
+                    random_state=random_state,
+                )
+            _run_leiden_r_compatible(
+                tmp,
+                resolution=res_grp,
+                objective_function=leiden_function,
+                random_state=random_state,
+                key_added="leiden_cnv",
+            )
+            sub_labels = tmp.obs["leiden_cnv"].values
+            unique_sub = np.unique(sub_labels)
+            sub_to_global = {
+                s: f"{grp_name}_{cluster_id_offset + i}" for i, s in enumerate(unique_sub)
+            }
+            for idx_local, idx_global in enumerate(np.where(grp_mask)[0]):
+                leiden_labels[idx_global] = sub_to_global[sub_labels[idx_local]]
+            cluster_id_offset += len(unique_sub)
+
+            logging.info(  # type: ignore
+                f"  Leiden [{grp_name}]: n={n_grp}, resolution={res_grp:.4f}, "
+                f"n_pcs={n_pcs_grp}, k={n_neighbors_grp}, "
+                f"graph={leiden_graph_method}, n_clusters={len(unique_sub)}"
+            )
 
     n_clusters = len(np.unique(leiden_labels))
     logging.info(  # type: ignore
@@ -492,6 +809,16 @@ def hmm_call_subclusters(
             if precomputed_emit_stds is not None
             else np.full(n_states, float(np.std(cnv_matrix[ref_mask])) if ref_mask.any() else 0.05)
         )
+        emit_sd_intercepts = (
+            np.asarray(precomputed_emit_sd_intercepts, dtype=np.float64)[:n_states]
+            if precomputed_emit_sd_intercepts is not None
+            else None
+        )
+        emit_sd_slopes = (
+            np.asarray(precomputed_emit_sd_slopes, dtype=np.float64)[:n_states]
+            if precomputed_emit_sd_slopes is not None
+            else None
+        )
         logging.info(f"  Using precomputed emit_means={np.round(emit_means, 4)}")  # type: ignore
     elif fit_method == "hspike":
         if cluster_is_ref.any():
@@ -505,16 +832,24 @@ def hmm_call_subclusters(
             )
         emit_means = emit_means[:n_states]
         emit_stds = emit_stds[:n_states]
+        emit_sd_intercepts = None
+        emit_sd_slopes = None
     elif fit_method == "fixed_log2":
         emit_means = _R_LOG2_STATE_MEANS[:n_states].copy()
         emit_stds = _R_LOG2_STATE_STDS[:n_states].copy()
+        emit_sd_intercepts = None
+        emit_sd_slopes = None
     elif fit_method == "fixed_copy_ratio":
         emit_means = _R_COPY_RATIO_STATE_MEANS[:n_states].copy()
         emit_stds = _R_COPY_RATIO_STATE_STDS[:n_states].copy()
+        emit_sd_intercepts = None
+        emit_sd_slopes = None
     else:  # adaptive
         emit_means, emit_stds = _fit_emission_params(
             cluster_means, adata, reference_key, reference_cat, fit_params=True
         )
+        emit_sd_intercepts = None
+        emit_sd_slopes = None
 
     # base_sd（单细胞水平 SD）
     base_sd = float(np.median(emit_stds))
@@ -550,6 +885,7 @@ def hmm_call_subclusters(
         chr_ends = chr_starts[1:] + [n_pos]
         chr_ranges = list(zip(chr_names, chr_starts, chr_ends))
 
+        state_seqs_raw = np.full((n_cl, n_pos), NEUTRAL_STATE, dtype=np.int32)
         state_seqs = np.full((n_cl, n_pos), NEUTRAL_STATE, dtype=np.int32)
 
         for chr_name, w_s, w_e in chr_ranges:
@@ -561,8 +897,14 @@ def hmm_call_subclusters(
 
             for ci in range(n_cl):
                 n_cells_ci = max(1, int(cluster_sizes[ci]))
-                sd_ci = base_sd / math.sqrt(n_cells_ci)
-                stds_ci = np.full(n_states, sd_ci, dtype=np.float64)
+                if emit_sd_intercepts is not None and emit_sd_slopes is not None:
+                    stds_ci = np.exp(
+                        emit_sd_intercepts + emit_sd_slopes * math.log(n_cells_ci)
+                    ).astype(np.float64)
+                    stds_ci = np.maximum(stds_ci, 1e-6)
+                else:
+                    sd_ci = base_sd / math.sqrt(n_cells_ci)
+                    stds_ci = np.full(n_states, sd_ci, dtype=np.float64)
 
                 if use_r_viterbi:
                     seq_chr = _viterbi_r_single(
@@ -572,6 +914,9 @@ def hmm_call_subclusters(
                     seq_chr = _viterbi_single_numpy(
                         chr_means[ci], log_trans_hmm, log_prior_hmm, emit_means, stds_ci
                     )
+
+                # 17_HMM_pred 的原始 state matrix 用于 proportion_cnv_R。
+                state_seqs_raw[ci, w_s:w_e] = seq_chr
 
                 # ── denoise 段长过滤（与 R denoise=TRUE 等价）────────────
                 if min_segment_length > 1:
@@ -597,11 +942,17 @@ def hmm_call_subclusters(
             state_seqs = _viterbi_batch_cpu(
                 cluster_means, log_trans_hmm, log_prior_hmm, emit_means, emit_stds, n_jobs_eff
             )
+        state_seqs_raw = state_seqs.copy()
         if min_segment_length > 1:
             for ci in range(n_cl):
                 state_seqs[ci] = _denoise_segments(
                     state_seqs[ci], NEUTRAL_STATE, min_segment_length
                 )
+
+    # 每个 subcluster 的 HMM CNV burden：17_HMM_pred 原始状态中非中性位点比例。
+    # R strict 脚本中的 proportion_cnv_R 来自 obj_hm@expr.data，而不是
+    # denoise 后的 pred_cnv_regions；region call 仍使用 denoise 后 state_seqs。
+    non_neutral_frac_clusters = (state_seqs_raw != NEUTRAL_STATE).mean(axis=1).astype(np.float32)
 
     # ── 7. R 等价 Tumor/Normal 判定（subcluster 级 "含 CNV 段" 二分类）──────
     # R: pred_cnv_regions.dat 中出现该 subcluster → Tumor.obs
@@ -636,7 +987,6 @@ def hmm_call_subclusters(
         )
     else:
         # legacy 模式：非中性占比阈值
-        non_neutral_frac_clusters = (state_seqs != NEUTRAL_STATE).mean(axis=1)
         if cluster_is_ref.any():
             ref_nf = non_neutral_frac_clusters[cluster_is_ref]
             thr_ref95 = float(np.percentile(ref_nf, 95))
@@ -656,35 +1006,41 @@ def hmm_call_subclusters(
         f"({tumor_clust_pct:.0f}%) / {n_cl}"
     )
 
-    # ── 8. 细胞级 CNV burden（连续打分，独立于 cluster 离散判定）──────────────
-    # 设计动机（针对 ROC 区分度）：
-    #   原实现 cell_score = cluster_n_segments（簇级常量），同 cluster 内细胞同分，
-    #   细胞间无差异 → AUC 退化。
-    # R 等价物：cell-level expression deviation magnitude。
-    # 这里取每细胞所有基因的 |X_cnv - neutral_anchor| mean，
-    # 即 L1 距离离中性点的平均距离，单位与 HMM 输入一致：
-    #   - copy-ratio 空间：anchor=1.0，score ≈ 平均拷贝偏离
-    #   - log2 空间：anchor=0.0，score ≈ 平均 log2 信号强度
-    # 完全数据驱动，不依赖 HMM call，对污染和阈值都稳健。
+    # ── 8. 细胞级 HMM burden + 连续表达偏离诊断量 ───────────────────────────
+    # score 必须保持为 R inferCNV 的 proportion_cnv_R 对应物：
+    # 原始 17_HMM_pred HMM state != neutral 的比例。subcluster 模式下，同一
+    # subcluster 内细胞共享同一条 HMM 状态序列，因此该比例按 subcluster 广播。
+    #
+    # 连续表达偏离 mean(|X-neutral|) 另存为 expr_deviation，供 ROC/诊断使用；
+    # 它不是 HMM burden，不能写入 {key_added}_score。
     neutral_anchor_cell = 1.0 if is_copy_ratio else 0.0
-    cell_scores = np.abs(cnv_matrix - neutral_anchor_cell).mean(axis=1).astype(np.float32)
+    cell_expr_deviation = np.abs(cnv_matrix - neutral_anchor_cell).mean(axis=1).astype(np.float32)
 
+    cell_scores = np.empty(adata.n_obs, dtype=np.float32)
     cell_tumor_calls = np.empty(adata.n_obs, dtype=object)
     cell_leiden = np.empty(adata.n_obs, dtype=object)
 
     for ci, cl in enumerate(unique_clusters):
         mask_cl = (leiden_labels == cl)
+        cell_scores[mask_cl] = non_neutral_frac_clusters[ci]
         cell_tumor_calls[mask_cl] = cluster_tumor_calls[ci]
         cell_leiden[mask_cl] = cl
 
-    # 诊断：cell_score 在 ref vs obs 上的分布（验证连续性 & 区分度）
+    # 诊断：分别报告 HMM burden 与连续表达偏离，避免两个概念混用。
     if ref_mask.any() and (~ref_mask).any():
         s_ref = cell_scores[ref_mask]
         s_obs = cell_scores[~ref_mask]
+        d_ref = cell_expr_deviation[ref_mask]
+        d_obs = cell_expr_deviation[~ref_mask]
         logging.info(  # type: ignore
-            f"  Continuous cell_score (|X - {neutral_anchor_cell:.1f}|.mean): "
+            "  HMM burden score (state != neutral).mean: "
             f"ref median={float(np.median(s_ref)):.4f} (IQR {float(np.percentile(s_ref, 25)):.4f}-{float(np.percentile(s_ref, 75)):.4f}); "
             f"obs median={float(np.median(s_obs)):.4f} (IQR {float(np.percentile(s_obs, 25)):.4f}-{float(np.percentile(s_obs, 75)):.4f})"
+        )
+        logging.info(  # type: ignore
+            f"  Expr deviation (|X - {neutral_anchor_cell:.1f}|.mean): "
+            f"ref median={float(np.median(d_ref)):.4f} (IQR {float(np.percentile(d_ref, 25)):.4f}-{float(np.percentile(d_ref, 75)):.4f}); "
+            f"obs median={float(np.median(d_obs)):.4f} (IQR {float(np.percentile(d_obs, 25)):.4f}-{float(np.percentile(d_obs, 75)):.4f})"
         )
 
     tumor_cell_pct = (cell_tumor_calls == "Tumor").mean() * 100
@@ -695,12 +1051,14 @@ def hmm_call_subclusters(
     if inplace:
         adata.obs[key_added] = cell_tumor_calls
         adata.obs[f"{key_added}_score"] = cell_scores
+        adata.obs[f"{key_added}_expr_deviation"] = cell_expr_deviation
         adata.obs[f"{key_added}_subcluster"] = cell_leiden
         return None
     else:
         return {
             key_added: cell_tumor_calls,
             f"{key_added}_score": cell_scores,
+            f"{key_added}_expr_deviation": cell_expr_deviation,
             f"{key_added}_subcluster": cell_leiden,
         }
 

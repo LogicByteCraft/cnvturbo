@@ -33,7 +33,6 @@ dependencies = [
     'pycairo>=1.20; sys_platform == "win32"',
     'leidenalg',
     'pyreadr',
-    'pytest-benchmark',
     # for debug logging (referenced from the issue template)
     "session-info",
     "pybiomart>=0.2.0",
@@ -89,34 +88,11 @@ doc = [
     "pandas",
     "setuptools", # required for sphinxcontrib-bibtex
 ]
-test = [
-    "pytest",
-    "coverage",
-    "openpyxl", # required for one of the scanpy datasets used in the tests
-]
-
 [tool.hatch.version]
 source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cnvturbo"]
-
-[tool.coverage.run]
-source = ["cnvturbo"]
-omit = [
-    "**/test_*.py",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-xfail_strict = true
-addopts = [
-    # "-Werror",  # if 3rd party libs raise DeprecationWarnings, just use filterwarnings below
-    "--import-mode=importlib",  # allow using test files with same name
-]
-filterwarnings = [
-    # "ignore:.*U.*mode is deprecated:DeprecationWarning",
-]
 
 [tool.ruff]
 src = ["src"]
