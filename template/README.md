@@ -58,3 +58,18 @@ proportion_cnv > P95(proportion_cnv | reference cells)
 where `cnv_score` is computed from the R-compatible denoised copy-ratio matrix,
 and `proportion_cnv` is the HMM non-neutral state fraction written by
 `hmm_call_subclusters`.
+
+## Acknowledgements
+
+`cnvturbo` stands on the shoulders of two important open-source CNV projects:
+
+- [broadinstitute/infercnv](https://github.com/broadinstitute/infercnv)  
+  The R inferCNV project defines the reference workflow that this template aims
+  to reproduce in a standalone Python implementation.
+
+- [icbi-lab/infercnvpy](https://github.com/icbi-lab/infercnvpy)  
+  The original Python/Scanpy-oriented inferCNV implementation inspired the
+  AnnData-friendly API surface and provided part of the historical foundation
+  from which `cnvturbo` evolved.
+
+We gratefully acknowledge the authors and contributors of both projects.
