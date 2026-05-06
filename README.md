@@ -404,3 +404,5 @@ pip install -e ".[dev,test]"
 pre-commit install
 pytest
 ```
+
+_Repository metadata refresh marker: 2026-05-06._
